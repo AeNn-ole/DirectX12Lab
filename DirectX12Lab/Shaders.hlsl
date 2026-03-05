@@ -1,3 +1,8 @@
+// ── Текстура и сэмплер ────────────────────────────────────────────────────
+Texture2D    gTexture : register(t0);
+SamplerState gSampler : register(s0);
+
+// ── Константный буфер (register b0) ──────────────────────────────────────
 cbuffer ObjectCB : register(b0)
 {
     float4x4 gWorld;
@@ -10,63 +15,62 @@ cbuffer ObjectCB : register(b0)
     float4   gDiffuse;
     float4   gSpecular;
     float    gSpecPower; float3 _pad2;
+
+    float2   gUVOffset;   // анимационное смещение UV
+    float2   gUVTiling;   // масштаб тайлинга
 };
 
+// ── Вход вершинного шейдера ───────────────────────────────────────────────
 struct VSIn
 {
-    float3 PosL    : POSITION;
-    float3 NormalL : NORMAL;
+    float3 PosL     : POSITION;
+    float3 NormalL  : NORMAL;
+    float2 TexCoord : TEXCOORD0;   // ← новое: UV из буфера вершин
 };
 
+// ── Интерполяты, передаваемые в пиксельный шейдер ────────────────────────
 struct PSIn
 {
-    float4 PosH    : SV_POSITION;
-    float3 PosW    : POSITION;
-    float3 NormalW : NORMAL;
+    float4 PosH     : SV_POSITION;
+    float3 PosW     : POSITION;
+    float3 NormalW  : NORMAL;
+    float2 TexCoord : TEXCOORD0;   // ← тайлинг + анимация применяются здесь
 };
 
+// ── Вершинный шейдер ──────────────────────────────────────────────────────
 PSIn VSMain(VSIn vin)
 {
     PSIn vout;
 
-    float4 posW = mul(float4(vin.PosL, 1.0f), gWorld);
-    vout.PosW = posW.xyz;
-    vout.NormalW = normalize(mul(vin.NormalL, (float3x3)gWorld));
-    vout.PosH = mul(float4(vin.PosL, 1.0f), gWorldViewProj);
+    float4 posW   = mul(float4(vin.PosL, 1.0f), gWorld);
+    vout.PosW     = posW.xyz;
+    vout.NormalW  = normalize(mul(vin.NormalL, (float3x3)gWorld));
+    vout.PosH     = mul(float4(vin.PosL, 1.0f), gWorldViewProj);
+
+    // Применяем тайлинг и анимационный сдвиг к UV
+    vout.TexCoord = vin.TexCoord * gUVTiling + gUVOffset;
 
     return vout;
 }
 
+// ── Пиксельный шейдер ────────────────────────────────────────────────────
 float4 PSMain(PSIn pin) : SV_TARGET
 {
     float3 N = normalize(pin.NormalW);
     float3 L = normalize(-gLightDirW);
     float3 V = normalize(gEyePosW - pin.PosW);
 
-    float t = saturate(pin.PosW.y * 0.5f + 0.5f);
+    // Базовый цвет: берём из текстуры
+    float4 texSample = gTexture.Sample(gSampler, pin.TexCoord);
+    float3 baseColor = texSample.rgb;
 
-    float3 colPurple = float3(0.45f, 0.20f, 0.95f);
-    float3 colBlue   = float3(0.25f, 0.75f, 1.00f);
-    float3 colWhite  = float3(1.00f, 1.00f, 1.00f);
-
-    float3 baseColor;
-    if (t < 0.5f)
-    {
-        float u = smoothstep(0.0f, 0.5f, t);
-        baseColor = lerp(colPurple, colBlue, u);
-    }
-    else
-    {
-        float u = smoothstep(0.5f, 1.0f, t);
-        baseColor = lerp(colBlue, colWhite, u);
-    }
-
+    // Освещение по Фонгу
     float ndotl = saturate(dot(N, L));
-    float3 lit = (0.18f + 0.82f * ndotl);
+    float3 lit  = 0.18f + 0.82f * ndotl;
 
-    float3 H = normalize(L + V);
-    float spec = pow(saturate(dot(N, H)), 64.0f);
+    float3 H    = normalize(L + V);
+    float  spec = pow(saturate(dot(N, H)), gSpecPower);
 
     float3 color = baseColor * lit + spec.xxx * 0.35f;
-    return float4(color, 1.0f);
+    return float4(color, texSample.a);
 }

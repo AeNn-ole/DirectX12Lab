@@ -28,12 +28,12 @@ static double GetQpf()
 
 bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
 {
-    try {  // ЗАМЕНИТЕ __try НА try
+    try {  
         m_window = new Window();
         m_input = new Input();
         m_input->Reset();
 
-        if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"DX12 Labu-labu dab dab"))
+        if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"DX12 Chebupelya"))
             return false;
 
         m_secondsPerTick = 1.0 / GetQpf();
@@ -51,8 +51,8 @@ bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
 
         return true;
     }
-    catch (const std::exception& e) {  // ЗАМЕНИТЕ __except НА catch
-        // Выводим сообщение об ошибке
+    catch (const std::exception& e) { 
+        
         std::string error = "Initialization failed: ";
         error += e.what();
         MessageBoxA(nullptr, error.c_str(), "Error", MB_OK | MB_ICONERROR);

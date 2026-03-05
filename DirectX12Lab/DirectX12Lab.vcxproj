@@ -135,6 +135,7 @@
     <ClCompile Include="DirectContext.cpp" />
     <ClCompile Include="InputHandler.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="ObjLoader.cpp" />
     <ClCompile Include="test.cpp" />
     <ClCompile Include="WindowManager.cpp" />
   </ItemGroup>
@@ -142,6 +143,7 @@
     <ClInclude Include="Application.h" />
     <ClInclude Include="DIrectContext.h" />
     <ClInclude Include="InputHandler.h" />
+    <ClInclude Include="ObjLoader.h" />
     <ClInclude Include="WindowManager.h" />
   </ItemGroup>
   <ItemGroup>
