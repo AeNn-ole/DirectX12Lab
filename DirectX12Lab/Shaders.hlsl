@@ -18,6 +18,8 @@ cbuffer ObjectCB : register(b0)
 
     float2   gUVOffset;   // анимационное смещение UV
     float2   gUVTiling;   // масштаб тайлинга
+    
+    float   gTime; // время для анимации
 };
 
 // ── Вход вершинного шейдера ───────────────────────────────────────────────
@@ -41,11 +43,18 @@ struct PSIn
 PSIn VSMain(VSIn vin)
 {
     PSIn vout;
+    
+    float centerY = 0.0f; 
 
-    float4 posW   = mul(float4(vin.PosL, 1.0f), gWorld);
+    float scaleY = 1.0f + sin(gTime * 35) * 0.6f;
+
+    float3 animatedPos = vin.PosL;
+    animatedPos.y *= scaleY;
+
+    float4 posW = mul(float4(animatedPos, 1.0f), gWorld);
     vout.PosW     = posW.xyz;
     vout.NormalW  = normalize(mul(vin.NormalL, (float3x3)gWorld));
-    vout.PosH     = mul(float4(vin.PosL, 1.0f), gWorldViewProj);
+    vout.PosH = mul(float4(animatedPos, 1.0f), gWorldViewProj);
 
     // Применяем тайлинг и анимационный сдвиг к UV
     vout.TexCoord = vin.TexCoord * gUVTiling + gUVOffset;

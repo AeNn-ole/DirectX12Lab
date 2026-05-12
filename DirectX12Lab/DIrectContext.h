@@ -65,6 +65,9 @@ private:
         float SpecPower  = 32.0f;
         float _pad2[3]   = { 0, 0, 0 };
 
+        float gTime;
+        float padTime[3];
+
         DirectX::XMFLOAT2 UVOffset{ 0.f, 0.f };
         DirectX::XMFLOAT2 UVTiling{ 1.f, 1.f };
     };

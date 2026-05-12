@@ -590,6 +590,7 @@ void D3D12Context::UpdateConstantBufferForMaterial(int mi)
     cb.UVOffset = { m_totalTime * 0.02f, 0.f };
     cb.UVTiling = { 1.f, 1.f };
 
+	cb.gTime = m_totalTime;
     // Пишем в слот mi константного буфера
     std::memcpy(m_mappedObjectCB + (size_t)mi * m_objectCBByteSize, &cb, sizeof(cb));
 }
