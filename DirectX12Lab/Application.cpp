@@ -1,3 +1,6 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include "Application.h"
 #include "WindowManager.h"
 #include "InputHandler.h"
@@ -13,17 +16,10 @@
 #pragma comment(lib, "d3dcompiler.lib")
 
 static uint64_t GetQpc()
-{
-    LARGE_INTEGER t{}; QueryPerformanceCounter(&t);
-    return static_cast<uint64_t>(t.QuadPart);
-}
+{ LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return (uint64_t)t.QuadPart; }
 static double GetQpf()
-{
-    LARGE_INTEGER f{}; QueryPerformanceFrequency(&f);
-    return static_cast<double>(f.QuadPart);
-}
+{ LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return (double)f.QuadPart; }
 
-// ─────────────────────────────────────────────────────────────────────────────
 bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
 {
     try {
@@ -37,7 +33,7 @@ bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
         m_secondsPerTick = 1.0 / GetQpf();
         m_prevTick       = GetQpc();
 
-        m_renderer = new RenderingSystem();          // ← было: new D3D12Context()
+        m_renderer = new RenderingSystem();
 
         RECT rc{};
         GetClientRect(m_window->GetHwnd(), &rc);
@@ -50,20 +46,14 @@ bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
         return true;
     }
     catch (const std::exception& e) {
-        std::string msg = "Initialization failed: ";
-        msg += e.what();
+        std::string msg = "Initialization failed: "; msg += e.what();
         MessageBoxA(nullptr, msg.c_str(), "Error", MB_OK | MB_ICONERROR);
         return false;
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-void App::Render()
-{
-    if (m_renderer) m_renderer->Draw();              // ← было: m_dx12->Draw()
-}
+void App::Render() { if (m_renderer) m_renderer->Draw(); }
 
-// ─────────────────────────────────────────────────────────────────────────────
 int App::Run()
 {
     MSG msg{};
@@ -75,27 +65,63 @@ int App::Run()
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
-
         const uint64_t now = GetQpc();
         const double   dt  = (now - m_prevTick) * m_secondsPerTick;
         m_prevTick = now;
-
         Update(static_cast<float>(dt));
         Render();
     }
     return 0;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 void App::Update(float dt)
 {
     using namespace DirectX;
 
-    if (m_input && m_input->IsKeyDown(VK_ESCAPE))
-        m_exitRequested = true;
-
+    if (m_input && m_input->IsKeyDown(VK_ESCAPE)) m_exitRequested = true;
     if (!m_input || !m_renderer) return;
 
+    // ── НОВОЕ: F1 — toggle frustum culling, F2 — toggle octree culling ───
+    // Используем edge-trigger чтобы одно нажатие = одно переключение.
+    const bool f1 = m_input->IsKeyDown(VK_F1);
+    const bool f2 = m_input->IsKeyDown(VK_F2);
+
+    if (f1 && !m_prevF1)
+    {
+        m_renderer->ToggleFrustumCulling();
+        // Если frustum culling выкл — выключаем и octree (логично)
+        if (!m_renderer->IsFrustumCullingOn() && m_renderer->IsOctreeCullingOn())
+            m_renderer->ToggleOctreeCulling();
+    }
+    if (f2 && !m_prevF2)
+    {
+        // Octree culling без frustum culling не имеет смысла — включаем оба
+        if (!m_renderer->IsFrustumCullingOn())
+            m_renderer->ToggleFrustumCulling();
+        m_renderer->ToggleOctreeCulling();
+    }
+    m_prevF1 = f1;
+    m_prevF2 = f2;
+
+    // ── Обновляем заголовок окна с текущим режимом и числом видимых ──────
+    // Делаем это не каждый кадр (дорого), а раз в ~0.5 сек
+    m_titleTimer += dt;
+    if (m_titleTimer >= 0.5f && m_window)
+    {
+        m_titleTimer = 0.f;
+        const char* mode = "No culling";
+        if (m_renderer->IsFrustumCullingOn())
+            mode = m_renderer->IsOctreeCullingOn()
+                ? "Frustum + Octree culling"
+                : "Frustum culling";
+
+        wchar_t title[256];
+        swprintf_s(title, L"DX12 Deferred  |  %hs  |  Visible: %d  |  F1=Frustum  F2=Octree",
+                   mode, m_renderer->GetVisibleCount());
+        SetWindowTextW(m_window->GetHwnd(), title);
+    }
+
+    // ── Движение камеры (без изменений) ──────────────────────────────────
     const bool rmb = m_input->IsKeyDown(VK_RBUTTON);
     if (rmb)
     {
@@ -104,7 +130,7 @@ void App::Update(float dt)
 
         RECT rc{};
         GetClientRect(hwnd, &rc);
-        POINT centerClient{ (rc.right - rc.left) / 2, (rc.bottom - rc.top) / 2 };
+        POINT centerClient{ (rc.right-rc.left)/2, (rc.bottom-rc.top)/2 };
         POINT centerScreen = centerClient;
         ClientToScreen(hwnd, &centerScreen);
 
@@ -117,14 +143,12 @@ void App::Update(float dt)
 
         POINT curScreen{};
         GetCursorPos(&curScreen);
-
         const int   dx = curScreen.x - centerScreen.x;
         const int   dy = curScreen.y - centerScreen.y;
         const float mouseSens = 0.005f;
         m_camYaw   += dx * mouseSens;
         m_camPitch -= dy * mouseSens;
-
-        const float limit = DirectX::XM_PIDIV2 - 0.1f;
+        const float limit = XM_PIDIV2 - 0.1f;
         m_camPitch = std::clamp(m_camPitch, -limit, limit);
         SetCursorPos(centerScreen.x, centerScreen.y);
     }
@@ -152,10 +176,9 @@ void App::Update(float dt)
         XMStoreFloat3(&m_camPos, pos);
     }
 
-    m_renderer->SetCamera(m_camPos, m_camYaw, m_camPitch); // ← было: m_dx12->SetCamera
+    m_renderer->SetCamera(m_camPos, m_camYaw, m_camPitch);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 LRESULT App::HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg)
@@ -165,45 +188,36 @@ LRESULT App::HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         m_exitRequested = true;
         PostQuitMessage(0);
         return 0;
-
     case WM_KEYDOWN:
-        if (m_input) m_input->OnKeyDown(static_cast<uint32_t>(wparam));
+        if (m_input) m_input->OnKeyDown((uint32_t)wparam);
         return 0;
-
     case WM_KEYUP:
-        if (m_input) m_input->OnKeyUp(static_cast<uint32_t>(wparam));
+        if (m_input) m_input->OnKeyUp((uint32_t)wparam);
         return 0;
-
     case WM_RBUTTONDOWN:
         if (m_input) m_input->OnKeyDown(VK_RBUTTON);
         m_rmbLook = true;
         m_justEnteredRmbLook = true;
         GetCursorPos(&m_savedCursorPos);
-        ShowCursor(FALSE);
-        SetCapture(hwnd);
+        ShowCursor(FALSE); SetCapture(hwnd);
         return 0;
-
     case WM_RBUTTONUP:
         if (m_input) m_input->OnKeyUp(VK_RBUTTON);
         m_rmbLook = false;
         SetCursorPos(m_savedCursorPos.x, m_savedCursorPos.y);
-        ShowCursor(TRUE);
-        ReleaseCapture();
+        ShowCursor(TRUE); ReleaseCapture();
         return 0;
-
     case WM_MOUSEMOVE:
         if (m_input) m_input->OnMouseMove(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
         return 0;
-
     case WM_SIZE:
     {
         uint32_t w = (uint32_t)LOWORD(lparam);
         uint32_t h = (uint32_t)HIWORD(lparam);
         if (w == 0 || h == 0) return 0;
-        if (m_renderer) m_renderer->OnResize(w, h); // ← было: m_dx12->OnResize
+        if (m_renderer) m_renderer->OnResize(w, h);
         return 0;
     }
-
     default:
         return DefWindowProc(hwnd, msg, wparam, lparam);
     }

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 #include <wincodec.h>
 #include <DirectXMath.h>
 
@@ -13,7 +14,7 @@ using namespace DirectX;
 using Microsoft::WRL::ComPtr;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Утилиты
+// Утилиты (без изменений)
 // ─────────────────────────────────────────────────────────────────────────────
 static void ThrowIfFailed(HRESULT hr, const char* what)
 {
@@ -75,7 +76,6 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     m_dsvDescriptorSize    = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     m_cbvSrvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    // RTV(5) и DSV(1) — размеры фиксированные, модель ещё не нужна
     CreateDescriptorHeaps();
     CreateRtvForBackBuffers();
     CreateDepthStencil();
@@ -83,11 +83,12 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     m_viewport    = { 0, 0, (float)width, (float)height, 0, 1 };
     m_scissorRect = { 0, 0, (LONG)width,  (LONG)height };
 
-    XMStoreFloat4x4(&m_world, XMMatrixIdentity());
     XMVECTOR eye = XMVectorSet(m_eyePos.x, m_eyePos.y, m_eyePos.z, 1);
     XMStoreFloat4x4(&m_view, XMMatrixLookAtLH(eye, XMVectorZero(), XMVectorSet(0,1,0,0)));
     float asp = height > 0 ? (float)width / height : 1.f;
-    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, asp, 0.1f, 1000.f));
+    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, asp, 0.1f, 5000.f));
+    //                                                        дальняя плоскость увеличена ↑
+    //                                                        100 экземпляров требуют дальнего видения
 
     // ── Загрузка модели ───────────────────────────────────────────────────
     if (!LoadObj(L"model.obj", m_model))
@@ -100,27 +101,109 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
 
     m_numMaterials = (uint32_t)m_model.materials.size();
 
+    // ── НОВОЕ: вычислить AABB модели и разбросать экземпляры ─────────────
+    ComputeModelBounds();
+    ScatterInstances();
+    BuildOctree();   // строим дерево сразу после расстановки
+
     BuildShaders();
     BuildGeometry();
     BuildConstantBuffers();
-    BuildDescriptorViews();   // создаёт CBV/SRV кучу, инициализирует GBuffer
+    BuildDescriptorViews();
     BuildRootSignatures();
     BuildPSOs();
-    InitLights();             // расставляет источники по сцене
+    InitLights();
 
     m_initialized = true;
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// НОВОЕ: вычисляем AABB по всем вершинам модели.
+// Центр и радиус используются в ScatterInstances (и в задании 2 для culling).
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderingSystem::ComputeModelBounds()
+{
+    if (m_model.vertices.empty()) { m_modelRadius = 1.f; return; }
+
+    XMVECTOR vmin = XMVectorReplicate( FLT_MAX);
+    XMVECTOR vmax = XMVectorReplicate(-FLT_MAX);
+
+    for (const auto& v : m_model.vertices)
+    {
+        XMVECTOR p = XMLoadFloat3(&v.Pos);
+        vmin = XMVectorMin(vmin, p);
+        vmax = XMVectorMax(vmax, p);
+    }
+
+    XMVECTOR center = XMVectorScale(XMVectorAdd(vmin, vmax), 0.5f);
+    XMStoreFloat3(&m_modelCenter, center);
+
+    // Радиус = половина диагонали AABB (консервативная, но быстрая оценка)
+    XMVECTOR halfDiag = XMVectorScale(XMVectorSubtract(vmax, vmin), 0.5f);
+    m_modelRadius = XMVectorGetX(XMVector3Length(halfDiag));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// НОВОЕ: создаём kMaxInstances экземпляров сеткой 10×10.
+//
+// Шаг между объектами = diameter * 1.5 — достаточно места чтобы не слипались,
+// но достаточно плотно чтобы эффект был виден.
+//
+// Массив m_instances на CPU. GPU-память выделена в BuildConstantBuffers.
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderingSystem::ScatterInstances()
+{
+    m_instances.clear();
+    m_instances.reserve(kMaxInstances);
+
+    const int   side    = (int)std::sqrtf((float)kMaxInstances); // 10
+    const float spacing = m_modelRadius * 2.f * 1.5f;            // 1.5× диаметр
+
+    // Сдвигаем сетку так чтобы центр был у начала координат
+    const float offset = -spacing * (side - 1) * 0.5f;
+
+    for (int z = 0; z < side; ++z)
+    {
+        for (int x = 0; x < side; ++x)
+        {
+            InstanceData d{};
+
+            float wx = offset + x * spacing;
+            float wz = offset + z * spacing;
+
+            // Матрица перемещения (масштаб и поворот при желании добавить сюда же)
+            XMMATRIX T = XMMatrixTranslation(wx, 0.f, wz);
+            XMStoreFloat4x4(&d.World, T);
+
+            // Центр ограничивающей сферы в мировых координатах
+            d.Center = {
+                wx + m_modelCenter.x,
+                m_modelCenter.y,
+                wz + m_modelCenter.z
+            };
+            d.Radius = m_modelRadius;
+
+            m_instances.push_back(d);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::Shutdown()
 {
     if (m_cmdQueue) FlushCommandQueue();
-    if (m_objectCB  && m_mappedObjectCB)  { m_objectCB->Unmap(0,nullptr);  m_mappedObjectCB  = nullptr; }
-    if (m_lightingCB && m_mappedLightingCB) { m_lightingCB->Unmap(0,nullptr); m_mappedLightingCB = nullptr; }
+    if (m_instanceCB && m_mappedInstanceCB)
+    { m_instanceCB->Unmap(0, nullptr); m_mappedInstanceCB = nullptr; }
+    if (m_materialCB && m_mappedMaterialCB)
+    { m_materialCB->Unmap(0, nullptr); m_mappedMaterialCB = nullptr; }
+    if (m_lightingCB && m_mappedLightingCB)
+    { m_lightingCB->Unmap(0, nullptr); m_mappedLightingCB = nullptr; }
     if (m_fenceEvent) { CloseHandle(m_fenceEvent); m_fenceEvent = nullptr; }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Без изменений
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::CreateDevice()
 {
@@ -163,15 +246,11 @@ bool RenderingSystem::CreateSwapChain()
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RTV куча: слоты [0,1] = swap chain, слоты [2,3,4] = GBuffer RT0/RT1/RT2
-// DSV куча: слот [0] = depth buffer
-// ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::CreateDescriptorHeaps()
 {
     {
         D3D12_DESCRIPTOR_HEAP_DESC rd{};
-        rd.NumDescriptors = kSwapChainBufferCount + GBuffer::Count; // 2 + 3 = 5
+        rd.NumDescriptors = kSwapChainBufferCount + GBuffer::Count;
         rd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         ThrowIfFailed(m_device->CreateDescriptorHeap(&rd, IID_PPV_ARGS(&m_rtvHeap)), "RTV Heap");
     }
@@ -196,11 +275,6 @@ bool RenderingSystem::CreateRtvForBackBuffers()
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Глубина: ресурс создаётся как R24G8_TYPELESS, что позволяет иметь
-// одновременно DSV (D24_UNORM_S8_UINT) и SRV (R24_UNORM_X8_TYPELESS).
-// Стандартный D24_UNORM_S8_UINT нельзя привязать как SRV — compile error.
-// ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::CreateDepthStencil()
 {
     m_depthStencilBuffer.Reset();
@@ -211,12 +285,11 @@ bool RenderingSystem::CreateDepthStencil()
     td.Height           = m_height;
     td.DepthOrArraySize = 1;
     td.MipLevels        = 1;
-    td.Format           = DXGI_FORMAT_R24G8_TYPELESS; // ← typeless: нужен для SRV
+    td.Format           = DXGI_FORMAT_R24G8_TYPELESS;
     td.SampleDesc.Count = 1;
     td.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     td.Flags            = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
 
-    // Optimized clear value должен использовать конкретный formат (не typeless)
     D3D12_CLEAR_VALUE cv{};
     cv.Format              = DXGI_FORMAT_D24_UNORM_S8_UINT;
     cv.DepthStencil.Depth  = 1.f;
@@ -226,7 +299,6 @@ bool RenderingSystem::CreateDepthStencil()
     ThrowIfFailed(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
         D3D12_RESOURCE_STATE_COMMON, &cv, IID_PPV_ARGS(&m_depthStencilBuffer)), "Create DS");
 
-    // Переводим в DEPTH_WRITE
     ThrowIfFailed(m_cmdAlloc->Reset(), "Alloc Reset DS");
     ThrowIfFailed(m_cmdList->Reset(m_cmdAlloc.Get(), nullptr), "List Reset DS");
     D3D12_RESOURCE_BARRIER b{};
@@ -239,7 +311,6 @@ bool RenderingSystem::CreateDepthStencil()
     m_cmdQueue->ExecuteCommandLists(1, ls);
     FlushCommandQueue();
 
-    // DSV — смотрит на данные как D24_UNORM_S8_UINT
     D3D12_DEPTH_STENCIL_VIEW_DESC dsvd{};
     dsvd.Format        = DXGI_FORMAT_D24_UNORM_S8_UINT;
     dsvd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
@@ -249,10 +320,6 @@ bool RenderingSystem::CreateDepthStencil()
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Создаёт SRV для глубины в слоте [2N+3] CBV/SRV кучи.
-// Вынесено отдельно: нужно повторно вызывать при OnResize.
-// ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::RecreateDepthSRV()
 {
     const uint32_t N = m_numMaterials;
@@ -260,17 +327,13 @@ void RenderingSystem::RecreateDepthSRV()
     h.ptr += (SIZE_T)((2 * N + 3) * m_cbvSrvDescriptorSize);
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srvd{};
-    srvd.Format                  = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; // читаем глубину как float
+    srvd.Format                  = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
     srvd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvd.Texture2D.MipLevels     = 1;
     m_device->CreateShaderResourceView(m_depthStencilBuffer.Get(), &srvd, h);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Компиляция шейдеров:
-//   GBuffer.hlsl  — VSMain  + PSMain        (geometry pass)
-//   Lighting.hlsl — VSMain_Light + PSMain_Light (lighting pass)
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildShaders()
 {
@@ -296,16 +359,12 @@ bool RenderingSystem::BuildShaders()
     compile(L"Lighting.hlsl", "VSMain_Light",  "vs_5_0", m_lightVS);
     compile(L"Lighting.hlsl", "PSMain_Light",  "ps_5_0", m_lightPS);
 
-    // Input layout для geometry pass (POSITION + NORMAL + TEXCOORD)
     m_inputLayout[0] = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     m_inputLayout[1] = { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     m_inputLayout[2] = { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// VB / IB — без изменений относительно D3D12Context
-// ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildGeometry()
 {
     const UINT64 vbBytes = (UINT64)m_model.vertices.size() * sizeof(ObjVertex);
@@ -359,49 +418,76 @@ bool RenderingSystem::BuildGeometry()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Два константных буфера: geometry CB (N материалов) + lighting CB (1 слот)
+// ИЗМЕНЕНО: три CB вместо двух.
+//
+//   m_instanceCB  — kMaxInstances слотов × PerInstanceCB (World, WVP, Eye, LightDir)
+//   m_materialCB  — N_mat слотов × PerMaterialCB (Kd, Ks, Ka, Ns, UV)
+//   m_lightingCB  — 1 слот × LightingConstants (без изменений)
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildConstantBuffers()
 {
-    // Geometry CB
-    m_objectCBByteSize = AlignCB(sizeof(ObjectConstants));
+    // Instance CB — один слот на каждый экземпляр
+    m_instanceCBByteSize = AlignCB(sizeof(PerInstanceCB));
     {
-        UINT64 total = (UINT64)m_numMaterials * m_objectCBByteSize;
+        UINT64 total = (UINT64)kMaxInstances * m_instanceCBByteSize;
         auto up = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
         auto bd = BufDesc(total);
         ThrowIfFailed(m_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_objectCB)), "Create Obj CB");
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_instanceCB)),
+            "Create Instance CB");
         D3D12_RANGE rr{0,0};
-        ThrowIfFailed(m_objectCB->Map(0, &rr, reinterpret_cast<void**>(&m_mappedObjectCB)), "Map Obj CB");
+        ThrowIfFailed(m_instanceCB->Map(0, &rr,
+            reinterpret_cast<void**>(&m_mappedInstanceCB)), "Map Instance CB");
     }
-    // Lighting CB (один слот — всегда aligned)
+
+    // Material CB — один слот на каждый материал
+    m_materialCBByteSize = AlignCB(sizeof(PerMaterialCB));
+    {
+        UINT64 total = (UINT64)m_numMaterials * m_materialCBByteSize;
+        auto up = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        auto bd = BufDesc(total);
+        ThrowIfFailed(m_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_materialCB)),
+            "Create Material CB");
+        D3D12_RANGE rr{0,0};
+        ThrowIfFailed(m_materialCB->Map(0, &rr,
+            reinterpret_cast<void**>(&m_mappedMaterialCB)), "Map Material CB");
+    }
+
+    // Lighting CB (без изменений)
     {
         UINT64 total = AlignCB(sizeof(LightingConstants));
         auto up = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
         auto bd = BufDesc(total);
         ThrowIfFailed(m_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_lightingCB)), "Create Light CB");
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_lightingCB)),
+            "Create Light CB");
         D3D12_RANGE rr{0,0};
-        ThrowIfFailed(m_lightingCB->Map(0, &rr, reinterpret_cast<void**>(&m_mappedLightingCB)), "Map Light CB");
+        ThrowIfFailed(m_lightingCB->Map(0, &rr,
+            reinterpret_cast<void**>(&m_mappedLightingCB)), "Map Light CB");
     }
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BuildDescriptorViews — создаёт CBV/SRV кучу и заполняет все дескрипторы:
-//   [0..N-1]   CBV для материалов
-//   [N..2N-1]  SRV текстур материалов
-//   [2N..2N+2] SRV G-Buffer (через GBuffer::Create)
-//   [2N+3]     SRV глубины (через RecreateDepthSRV)
+// ИЗМЕНЕНО: CBV в куче теперь указывают на m_materialCB (PerMaterialCB),
+// а НЕ на старый ObjectConstants.
+//
+// Раскладка кучи (CBV/SRV, shader-visible):
+//   [0  .. N-1 ]   CBV → m_materialCB слот i          (geometry param[1])
+//   [N  .. 2N-1]   SRV → текстура материала i          (geometry param[2])
+//   [2N .. 2N+2]   SRV → G-Buffer (albedo, norm, spec)  (lighting param[0])
+//   [2N+3]         SRV → глубина                         (lighting param[0]+3)
+//
+// m_instanceCB доступен как inline root CBV (param[0]) — без дескриптора в куче.
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildDescriptorViews()
 {
     const uint32_t N = m_numMaterials;
 
-    // Размер кучи: 2N (материалы) + 3 (GBuffer) + 1 (depth)
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
-        hd.NumDescriptors = 2 * N + 4;
+        hd.NumDescriptors = 2 * N + 4;   // N CBV + N SRV + 3 GBuf + 1 depth
         hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ThrowIfFailed(m_device->CreateDescriptorHeap(&hd,
@@ -411,19 +497,19 @@ bool RenderingSystem::BuildDescriptorViews()
     D3D12_CPU_DESCRIPTOR_HANDLE cpuBase =
         m_cbvSrvHeap->GetCPUDescriptorHandleForHeapStart();
 
-    // ── CBV [0..N-1] ──────────────────────────────────────────────────────
+    // ── CBV [0..N-1]: указываем на m_materialCB ──────────────────────────
     for (uint32_t i = 0; i < N; ++i)
     {
         D3D12_CONSTANT_BUFFER_VIEW_DESC cbvd{};
-        cbvd.BufferLocation = m_objectCB->GetGPUVirtualAddress() +
-                              (UINT64)i * m_objectCBByteSize;
-        cbvd.SizeInBytes    = m_objectCBByteSize;
+        cbvd.BufferLocation = m_materialCB->GetGPUVirtualAddress() +
+                              (UINT64)i * m_materialCBByteSize;
+        cbvd.SizeInBytes    = m_materialCBByteSize;
         D3D12_CPU_DESCRIPTOR_HANDLE h = cpuBase;
         h.ptr += (SIZE_T)(i * m_cbvSrvDescriptorSize);
         m_device->CreateConstantBufferView(&cbvd, h);
     }
 
-    // ── SRV текстур [N..2N-1] ─────────────────────────────────────────────
+    // ── SRV текстур [N..2N-1] (без изменений) ────────────────────────────
     m_gpuMaterials.resize(N);
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -441,39 +527,62 @@ bool RenderingSystem::BuildDescriptorViews()
         m_device->CreateShaderResourceView(m_gpuMaterials[i].texture.Get(), &srvd, h);
     }
 
-    // ── SRV G-Buffer [2N..2N+2] — делегируем в GBuffer::Create ──────────
-    //   RTV в RTV-куче начиная со слота 2 (после двух swap chain буферов)
+    // ── G-Buffer SRV [2N..2N+2] ───────────────────────────────────────────
     m_gbuffer.Create(m_device.Get(), m_width, m_height,
         m_rtvHeap.Get(), kSwapChainBufferCount, m_rtvDescriptorSize,
         m_cbvSrvHeap.Get(), 2 * N, m_cbvSrvDescriptorSize);
 
-    // ── SRV глубины [2N+3] ────────────────────────────────────────────────
+    // ── Depth SRV [2N+3] ─────────────────────────────────────────────────
     RecreateDepthSRV();
 
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Root signature для GEOMETRY pass:
-//   param[0] — descriptor table: 1 CBV  (b0)  — константы материала
-//   param[1] — descriptor table: 1 SRV  (t0)  — текстура диффуза
-//   static sampler s0: LINEAR WRAP
+// ИЗМЕНЕНО: Root Signature geometry pass — теперь 3 параметра.
+//
+//   param[0]: inline root CBV  → b0  (PerInstanceCB)
+//             SetGraphicsRootConstantBufferView(0, gpuAddr)
+//             Без слота в куче — самый дешёвый способ передать меняющийся адрес.
+//
+//   param[1]: descriptor table 1×CBV → b1  (PerMaterialCB)
+//             SetGraphicsRootDescriptorTable(1, cbvHandle)
+//
+//   param[2]: descriptor table 1×SRV → t0  (текстура)
+//             SetGraphicsRootDescriptorTable(2, srvHandle)
+//
+// Lighting pass root sig — без изменений.
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildRootSignatures()
 {
     // ── Geometry ──────────────────────────────────────────────────────────
     {
+        // Два диапазона для param[1] и param[2]
         D3D12_DESCRIPTOR_RANGE ranges[2]{};
-        ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
-        ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+        ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0,   // b1
+                      D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+        ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,   // t0
+                      D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
 
-        D3D12_ROOT_PARAMETER params[2]{};
-        params[0].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[0].DescriptorTable  = { 1, &ranges[0] };
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_PARAMETER params[3]{};
+
+        // param[0]: inline CBV → b0 (PerInstanceCB)
+        // Тип DESCRIPTOR: GPU-адрес передаётся напрямую, без дескриптора в куче.
+        // Дешевле дескрипторной таблицы при частой смене (каждый экземпляр).
+        params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0;   // b0
+        params[0].Descriptor.RegisterSpace  = 0;
+        params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+
+        // param[1]: table 1×CBV → b1 (PerMaterialCB)
         params[1].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[1].DescriptorTable  = { 1, &ranges[1] };
-        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[1].DescriptorTable  = { 1, &ranges[0] };
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        // param[2]: table 1×SRV → t0 (текстура)
+        params[2].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2].DescriptorTable  = { 1, &ranges[1] };
+        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC samp{};
         samp.Filter         = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -485,7 +594,7 @@ bool RenderingSystem::BuildRootSignatures()
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters     = 2; rsd.pParameters = params;
+        rsd.NumParameters     = 3; rsd.pParameters = params;
         rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &samp;
         rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -496,27 +605,22 @@ bool RenderingSystem::BuildRootSignatures()
             ser->GetBufferSize(), IID_PPV_ARGS(&m_geometryRootSig)), "CreateRS Geom");
     }
 
-    // ── Lighting ──────────────────────────────────────────────────────────
-    // param[0] — descriptor table: 4 SRV  (t0-t3): albedo, normal, specular, depth
-    // param[1] — inline root CBV (b0): LightingConstants (без слота в куче!)
-    // static sampler s0: POINT CLAMP (для точного чтения пикселей)
+    // ── Lighting (без изменений) ──────────────────────────────────────────
     {
         D3D12_DESCRIPTOR_RANGE srvRange{};
         srvRange = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
 
         D3D12_ROOT_PARAMETER params[2]{};
-        // Таблица 4 SRV
         params[0].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[0].DescriptorTable  = { 1, &srvRange };
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        // Inline CBV — адрес буфера напрямую, без дескриптора в куче
         params[1].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[1].Descriptor.ShaderRegister = 0;
         params[1].Descriptor.RegisterSpace  = 0;
         params[1].ShaderVisibility          = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC samp{};
-        samp.Filter         = D3D12_FILTER_MIN_MAG_MIP_POINT;   // точное чтение
+        samp.Filter         = D3D12_FILTER_MIN_MAG_MIP_POINT;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         samp.MaxAnisotropy  = 1;
         samp.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
@@ -527,7 +631,7 @@ bool RenderingSystem::BuildRootSignatures()
         D3D12_ROOT_SIGNATURE_DESC rsd{};
         rsd.NumParameters     = 2; rsd.pParameters = params;
         rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &samp;
-        rsd.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE; // нет VB в lighting pass
+        rsd.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
         ComPtr<ID3DBlob> ser, err;
         HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &ser, &err);
@@ -538,6 +642,8 @@ bool RenderingSystem::BuildRootSignatures()
     return true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BuildPSOs — без изменений (PSO не зависит от разбивки CB)
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildPSOs()
 {
@@ -550,11 +656,8 @@ bool RenderingSystem::BuildPSOs()
     rast.DepthBiasClamp  = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
     rast.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
 
-    // ── Geometry PSO ──────────────────────────────────────────────────────
-    // Три RT (G-Buffer), глубина включена на запись
     {
         D3D12_BLEND_DESC blend{};
-        // Нужно включить запись для всех трёх RT
         for (int i = 0; i < 3; ++i)
             blend.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 
@@ -574,7 +677,7 @@ bool RenderingSystem::BuildPSOs()
         pd.SampleMask        = UINT_MAX;
         pd.InputLayout       = { m_inputLayout, 3 };
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.NumRenderTargets  = 3; // ← три RT одновременно
+        pd.NumRenderTargets  = 3;
         pd.RTVFormats[0]     = GBuffer::kFormats[GBuffer::Albedo];
         pd.RTVFormats[1]     = GBuffer::kFormats[GBuffer::Normal];
         pd.RTVFormats[2]     = GBuffer::kFormats[GBuffer::Specular];
@@ -585,18 +688,16 @@ bool RenderingSystem::BuildPSOs()
             IID_PPV_ARGS(&m_geometryPSO)), "Create Geometry PSO");
     }
 
-    // ── Lighting PSO ──────────────────────────────────────────────────────
-    // Один RT (back buffer), NO depth test, NO input layout (fullscreen triangle)
     {
         D3D12_BLEND_DESC blend{};
         blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 
         D3D12_DEPTH_STENCIL_DESC ds{};
-        ds.DepthEnable   = FALSE; // освещение считается в экранном пространстве
+        ds.DepthEnable   = FALSE;
         ds.StencilEnable = FALSE;
 
         D3D12_RASTERIZER_DESC rastLight = rast;
-        rastLight.CullMode = D3D12_CULL_MODE_NONE; // fullscreen triangle — нет culling
+        rastLight.CullMode = D3D12_CULL_MODE_NONE;
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature    = m_lightingRootSig.Get();
@@ -606,7 +707,7 @@ bool RenderingSystem::BuildPSOs()
         pd.RasterizerState   = rastLight;
         pd.DepthStencilState = ds;
         pd.SampleMask        = UINT_MAX;
-        pd.InputLayout       = { nullptr, 0 }; // ← нет VB, позиции из SV_VertexID
+        pd.InputLayout       = { nullptr, 0 };
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pd.NumRenderTargets  = 1;
         pd.RTVFormats[0]     = DXGI_FORMAT_R8G8B8A8_UNORM;
