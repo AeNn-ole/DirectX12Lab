@@ -225,4 +225,33 @@ private:
     // ── Источники света ───────────────────────────────────────────────────
     Light    m_lights[kMaxLights]{};
     int      m_numLights = 0;
+
+    // ── Дождь из точечных источников света ───────────────────────────────
+    struct RainDrop {
+        float x, z;          // горизонтальное положение (фиксируется при спавне)
+        float y;             // текущая высота (падает вниз)
+        float speed;         // скорость падения (units/sec)
+        bool  landed;        // true = уже на полу, светит постоянно
+        // цвет капли (варьируется)
+        float r, g, b;
+    };
+
+    static constexpr int kRainDrops = 8;   // сколько капель летит одновременно
+    static constexpr int kRainLanded = 6;   // максимум «лужиц» на полу
+    static constexpr float kSpawnHeight = 480.f;  // высота спавна
+    static constexpr float kFloorY = 0.f;    // Y пола Sponza
+
+    RainDrop m_rainDrops[kRainDrops]{};    // падающие
+    RainDrop m_landedDrops[kRainLanded]{}; // осевшие на полу
+    int      m_numLanded = 0;
+
+    // Для delta-time внутри Draw()
+    LARGE_INTEGER m_rainFreq{}, m_rainPrev{};
+    bool          m_rainTimerInited = false;
+
+    // Базовые (статические) источники, которые InitLights пишет до дождя
+    int m_numBaseLights = 0;
+
+    void InitRainDrops();
+    void UpdateRain(float dt);
 };
