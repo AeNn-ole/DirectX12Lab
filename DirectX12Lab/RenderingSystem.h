@@ -1,5 +1,4 @@
 #pragma once
-// NOMINMAX до любого windows.h — иначе макросы min/max сломают std::
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -30,6 +29,10 @@ public:
     bool IsOctreeCullingOn()     const { return m_octreeCullingEnabled;  }
     int  GetVisibleCount()       const { return m_lastVisibleCount; }
 
+    // Порог переключения 3D-сетка → билборд (в мировых единицах)
+    void  SetBillboardDistance(float d) { m_billboardDistance = d; }
+    float GetBillboardDistance()  const { return m_billboardDistance; }
+
 private:
     bool CreateDevice();
     bool CreateCommandObjects();
@@ -53,10 +56,11 @@ private:
     void UpdateInstanceCB(int instIdx);
     void UpdateMaterialCB(int mi);
     void UpdateLightingCB();
-    void CollectVisibleInstances();
+    void CollectVisibleInstances();  // разделяет на near/far
 
-    void GeometryPass();
-    void LightingPass();
+    void GeometryPass();    // 3D-сетки (ближние)
+    void LightingPass();    // deferred lighting
+    void BillboardPass();   // НОВОЕ: спрайты (дальние)
 
     bool LoadAndUploadTexture(const wchar_t* path,
                               Microsoft::WRL::ComPtr<ID3D12Resource>& outTex);
@@ -66,12 +70,10 @@ private:
     void RecreateDepthSRV();
 
 private:
-    // ── Константы — объявляем ПЕРВЫМИ чтобы массивы ниже их видели ───────
     static constexpr uint32_t kSwapChainBufferCount = 2;
     static constexpr int      kMaxInstances         = 2500;
     static constexpr int      kMaxLights            = 16;
 
-    // ── Вложенные структуры ───────────────────────────────────────────────
     struct InstanceData
     {
         DirectX::XMFLOAT4X4 World;
@@ -117,6 +119,16 @@ private:
         Light               Lights[kMaxLights];
     };
 
+    // НОВОЕ: CB для billboard pass — один на кадр
+    struct alignas(16) BillboardFrameCB
+    {
+        DirectX::XMFLOAT4X4 ViewProj;
+        DirectX::XMFLOAT3   CamRight; float _p0 = 0.f;
+        DirectX::XMFLOAT3   CamUp;    float _p1 = 0.f;
+        DirectX::XMFLOAT2   Size;     // ширина и высота билборда (мировые единицы)
+        float               _p2[2]   = {};
+    };
+
     struct GpuMaterial { Microsoft::WRL::ComPtr<ID3D12Resource> texture; };
 
     // ── Состояние ─────────────────────────────────────────────────────────
@@ -153,6 +165,7 @@ private:
 
     GBuffer m_gbuffer;
 
+    // ── Geometry + Lighting pipeline (без изменений) ──────────────────────
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_geometryRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_lightingRootSig;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPSO;
@@ -160,6 +173,27 @@ private:
 
     Microsoft::WRL::ComPtr<ID3DBlob> m_gbVS, m_gbPS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_lightVS, m_lightPS;
+
+    // ── НОВОЕ: Billboard pipeline ─────────────────────────────────────────
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_billboardRootSig;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_billboardPSO;
+    Microsoft::WRL::ComPtr<ID3DBlob>            m_billVS, m_billPS;
+
+    // CB для billboard pass (ViewProj, CamRight, CamUp, Size)
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_billboardFrameCB;
+    uint8_t* m_mappedBillboardFrameCB = nullptr;
+
+    // StructuredBuffer с центрами дальних экземпляров (обновляется каждый кадр)
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_billboardCentersBuf;
+    uint8_t* m_mappedBillboardCenters = nullptr;
+
+    // Текстура билборда (billboard.png, иначе fallback)
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_billboardTexture;
+
+    // Размер квада билборда = диаметр модели (вычисляется в ComputeModelBounds)
+    float m_billboardSize     = 4.f;
+    // Дистанция переключения 3D → billboard
+    float m_billboardDistance = 300.f;
 
     D3D12_INPUT_ELEMENT_DESC m_inputLayout[3]{};
 
@@ -191,8 +225,11 @@ private:
     bool             m_octreeCullingEnabled  = false;
     FrustumPlanes    m_frustumPlanes{};
     Octree           m_octree;
-    std::vector<int> m_visibleIndices;
     int              m_lastVisibleCount = 0;
+
+    // ИЗМЕНЕНО: два списка вместо одного
+    std::vector<int> m_nearIndices;   // 3D-сетки (< m_billboardDistance)
+    std::vector<int> m_farIndices;    // билборды  (>= m_billboardDistance)
 
     DirectX::XMFLOAT4X4 m_view{};
     DirectX::XMFLOAT4X4 m_proj{};
