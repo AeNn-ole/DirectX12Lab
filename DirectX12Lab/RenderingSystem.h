@@ -1,4 +1,7 @@
 #pragma once
+#ifndef NOMINMAX
+#define NOMINMAX   // избегаем конфликта windows.h min/max с std::min/std::max
+#endif
 #include <windows.h>
 #include <wrl.h>
 #include <d3d12.h>
@@ -30,6 +33,11 @@
 //   [N  .. 2N-1]  SRV — текстуры материалов (geometry pass)
 //   [2N .. 2N+2]  SRV — G-Buffer: albedo, normal, specular (lighting pass t0-t2)
 //   [2N+3]        SRV — глубина R24_UNORM_X8_TYPELESS (lighting pass t3)
+//   [2N+4]        SRV — StructuredBuffer<Light> с источниками света (lighting pass t4)
+//
+// Источники света хранятся в StructuredBuffer, а НЕ в constant buffer:
+// constant buffer слишком мал для большого количества источников
+// (дождь из ~200 точечных огней на полу Sponza).
 //
 // Раскладка RTV-кучи:
 //   [0,1]    — swap chain back buffers
@@ -61,6 +69,8 @@ private:
     bool BuildRootSignatures();   // два отдельных root sig
     bool BuildPSOs();             // geometry PSO (3 RT) + lighting PSO (1 RT)
     void InitLights();            // расставляет источники света по сцене
+    void InitRainDrops();         // инициализирует капли дождя
+    void UpdateRain(float dt);    // обновляет падение/приземление капель
 
     // ── Обновление данных каждый кадр ────────────────────────────────────
     void UpdateMaterialCB(int mi);   // обновляет слот mi в geometry CB
@@ -126,10 +136,18 @@ private:
         float             _pad[3]     = {};
     };
 
-    static constexpr int kMaxLights = 16;
+    // 200 — преподаватель сказал что 16 (предел constant buffer) слишком мало
+    // для дождя. Источники теперь хранятся в StructuredBuffer, не в CB,
+    // так что 200 — не проблема.
+    static constexpr int kMaxLights = 200;
 
     // ─────────────────────────────────────────────────────────────────────
-    // Lighting pass: один CB на кадр
+    // Lighting pass: один CB на кадр.
+    // Массив источников УБРАН из этой структуры — он живёт в отдельном
+    // StructuredBuffer (m_lightsBuffer), т.к. constant buffer слишком мал
+    // для 200 источников (200*64 = 12800 байт, а CB ограничен 65536, но
+    // главное — обновление через memcpy в structured buffer проще и
+    // гибче, и снимает искусственное ограничение в 16).
     // ─────────────────────────────────────────────────────────────────────
     struct alignas(16) LightingConstants
     {
@@ -138,7 +156,6 @@ private:
         DirectX::XMFLOAT2   ScreenSize;
         int                 NumLights = 0;
         float               _p1      = 0.f;
-        Light               Lights[kMaxLights]; // 16 * 64 = 1024 байта
     };
 
     struct GpuMaterial
@@ -169,7 +186,7 @@ private:
     // ── Дескрипторные кучи ────────────────────────────────────────────────
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_rtvHeap;    // 5 слотов
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_dsvHeap;    // 1 слот
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_cbvSrvHeap; // 2N+4 слота
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_cbvSrvHeap; // 2N+5 слотов
 
     uint32_t m_rtvDescriptorSize    = 0;
     uint32_t m_dsvDescriptorSize    = 0;
@@ -209,6 +226,13 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_lightingCB;      // lighting: 1 слот
     uint8_t* m_mappedLightingCB  = nullptr;
 
+    // ── StructuredBuffer источников света (upload heap, SRV t4) ───────────
+    // 200 источников * 64 байта = 12800 байт. Заменяет массив в constant
+    // buffer — позволяет легко иметь сотни источников (дождь).
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_lightsBuffer;
+    uint8_t* m_mappedLightsBuffer = nullptr;
+    static constexpr uint32_t kLightStride = sizeof(Light); // = 64 байта
+
     // ── Данные сцены ──────────────────────────────────────────────────────
     ObjModel                 m_model;
     std::vector<GpuMaterial> m_gpuMaterials;
@@ -225,33 +249,39 @@ private:
     // ── Источники света ───────────────────────────────────────────────────
     Light    m_lights[kMaxLights]{};
     int      m_numLights = 0;
+    int      m_numBaseLights = 0; // сколько источников статичны (не дождь)
 
-    // ── Дождь из точечных источников света ───────────────────────────────
-    struct RainDrop {
-        float x, z;          // горизонтальное положение (фиксируется при спавне)
-        float y;             // текущая высота (падает вниз)
-        float speed;         // скорость падения (units/sec)
-        bool  landed;        // true = уже на полу, светит постоянно
-        // цвет капли (варьируется)
-        float r, g, b;
+    // ─────────────────────────────────────────────────────────────────────
+    // Дождь из точечных источников света, падающих на пол Sponza (Y=0)
+    // и остающихся там навсегда (преподаватель просил, чтобы они НЕ
+    // пропадали — поэтому m_landedDrops накапливается, а не сбрасывается
+    // каждый кадр; при переполнении используется кольцевой буфер).
+    //
+    // Бюджет источников: 200 всего
+    //    8   — статичные (солнце, колоннады, спот и т.д., InitLights)
+    //    40  — падающие капли (постоянно активны)
+    //    152 — «лужицы» на полу (накапливаются, потом вытесняются по кругу)
+    // ─────────────────────────────────────────────────────────────────────
+    struct RainDrop
+    {
+        float x = 0.f, z = 0.f;
+        float y = 0.f;
+        float speed = 0.f;
+        bool  landed = false;
+        float r = 1.f, g = 1.f, b = 1.f;
     };
 
-    static constexpr int kRainDrops = 8;   // сколько капель летит одновременно
-    static constexpr int kRainLanded = 6;   // максимум «лужиц» на полу
-    static constexpr float kSpawnHeight = 480.f;  // высота спавна
-    static constexpr float kFloorY = 0.f;    // Y пола Sponza
+    static constexpr int   kRainDrops     = 40;
+    static constexpr int   kRainLanded    = kMaxLights - 8 - kRainDrops; // = 152
+    static constexpr float kSpawnHeight   = 480.f;
+    static constexpr float kFloorY        = 0.f; // пол Sponza
 
-    RainDrop m_rainDrops[kRainDrops]{};    // падающие
-    RainDrop m_landedDrops[kRainLanded]{}; // осевшие на полу
-    int      m_numLanded = 0;
+    RainDrop              m_rainDrops[kRainDrops]{};
+    std::vector<RainDrop> m_landedDrops;     // накапливается до kRainLanded
+    int                   m_landedWriteIdx = 0; // позиция для кольцевой записи
 
-    // Для delta-time внутри Draw()
-    LARGE_INTEGER m_rainFreq{}, m_rainPrev{};
+    // Таймер для delta-time симуляции дождя (независим от кадрового dt)
+    LARGE_INTEGER m_rainFreq{};
+    LARGE_INTEGER m_rainPrev{};
     bool          m_rainTimerInited = false;
-
-    // Базовые (статические) источники, которые InitLights пишет до дождя
-    int m_numBaseLights = 0;
-
-    void InitRainDrops();
-    void UpdateRain(float dt);
 };

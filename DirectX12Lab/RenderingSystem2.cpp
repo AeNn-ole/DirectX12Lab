@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 #include <wincodec.h>
 #include <DirectXMath.h>
 #define STB_IMAGE_IMPLEMENTATION
@@ -80,137 +81,175 @@ void RenderingSystem::InitLights()
     m_numLights = 0;
     auto& L = m_lights;
 
-    // ── Статические источники (те же, что были) ──────────────────────────
-    L[0].Type = 0;
-    L[0].Direction = { 0.4f, -0.8f, 0.2f };
-    L[0].Color = { 1.0f, 0.95f, 0.85f, 0.7f };
+    // ── 0: Directional — солнце сверху-сбоку (единственный на всю сцену) ──
+   L[0].Type      = 0;
+    L[0].Direction = { 0.4f, -0.8f, 0.2f };    // нормализуем в шейдере
+   L[0].Color     = { 1.0f, 0.95f, 0.85f, 0.1f }; // тёплый, умеренный
 
-    L[1].Type = 1; L[1].Position = { -350.f, 120.f, 0.f };
-    L[1].Range = 60.f; L[1].Color = { 1.0f, 0.5f, 0.1f, 1.5f };
+    // ── 1-4: Point 
+    // Левая колоннада
+    L[1].Type      = 1;
+    L[1].Position  = { -350.f, 120.f, 0.f };
+    L[1].Range     = 3.f;
+    L[1].Color     = { 1.0f, 0.5f, 0.1f, 1.5f }; // оранжевый огонь
 
-    L[2].Type = 1; L[2].Position = { -100.f, 120.f, 0.f };
-    L[2].Range = 60.f; L[2].Color = { 1.0f, 0.5f, 0.1f, 1.5f };
+    L[2].Type      = 1;
+    L[2].Position  = { -100.f, 120.f, 0.f };
+    L[2].Range     = 3.f;
+    L[2].Color     = { 1.0f, 0.5f, 0.1f, 1.5f };
 
-    L[3].Type = 1; L[3].Position = { 100.f, 120.f, 0.f };
-    L[3].Range = 60.f; L[3].Color = { 0.2f, 0.5f, 1.0f, 1.5f };
+    // Правая колоннада
+    L[3].Type      = 1;
+    L[3].Position  = {  100.f, 120.f, 0.f };
+    L[3].Range     = 3.f;
+    L[3].Color     = { 0.2f, 0.5f, 1.0f, 1.5f }; // холодный синий
 
-    L[4].Type = 1; L[4].Position = { 350.f, 120.f, 0.f };
-    L[4].Range = 60.f; L[4].Color = { 0.2f, 0.5f, 1.0f, 1.5f };
+    L[4].Type      = 1;
+    L[4].Position  = {  350.f, 120.f, 0.f };
+    L[4].Range     = 3.f;
+    L[4].Color     = { 0.2f, 0.5f, 1.0f, 1.5f };
 
-    L[5].Type = 1; L[5].Position = { 0.f, 400.f, 0.f };
-    L[5].Range = 60.f; L[5].Color = { 0.8f, 0.8f, 0.8f, 1.0f };
+    // ── 5: Point — свет в центре 
+    L[5].Type      = 1;
+    L[5].Position  = { 0.f, 400.f, 0.f };
+    L[5].Range     = 3.f;
+    L[5].Color     = { 0.8f, 0.8f, 0.8f, 1.0f }; // холодный белый
 
-    L[6].Type = 2; L[6].Position = { 0.f, 450.f, 0.f };
-    L[6].Direction = { 0.f, -1.f, 0.f };
-    L[6].Range = 30.f; L[6].SpotAngle = cosf(XM_PI / 6.f);
-    L[6].Color = { 0.87f, 0.9f, 1.0f, 2.0f };
+    // ── 6: Spot
+    L[6].Type       = 2;
+    L[6].Position   = { 0.f, 450.f, 0.f };
+    L[6].Direction  = { 0.f, -1.f, 0.f };       // строго вниз
+    L[6].Range      = 5.f;
+    L[6].SpotAngle  = cosf(XM_PI / 6.f);        // cos(30°) — угол полуконуса
+    L[6].Color      = { 0.87f, 0.9f, 1.0f, 2.0f }; // яркий тёплый
 
-    L[7].Type = 2; L[7].Position = { 500.f, 300.f, 0.f };
-    L[7].Direction = { -0.6f, -0.8f, 0.f };
-    L[7].Range = 40.f; L[7].SpotAngle = cosf(XM_PI / 8.f);
-    L[7].Color = { 0.9f, 0.7f, 1.0f, 1.8f };
+    // ── 7: Spot 
+    L[7].Type       = 2;
+    L[7].Position   = { 500.f, 300.f, 0.f };
+    L[7].Direction  = { -0.6f, -0.8f, 0.f };    // нормализуем в шейдере
+    L[7].Range      = 4.f;
+    L[7].SpotAngle  = cosf(XM_PI / 8.f);        // cos(22.5°) — узкий конус
+    L[7].Color      = { 0.9f, 0.7f, 1.0f, 1.8f }; // фиолетовый оттенок
 
+    // 8 статичных источников; остальные 192 слота (kMaxLights=200) отведены
+    // под дождь: 40 летящих капель + 152 "лужицы" на полу, которые остаются
+    // навсегда (см. UpdateRain).
     m_numBaseLights = 8;
-    m_numLights = 8;
+    m_numLights     = 8;
 
+    m_landedDrops.reserve(kRainLanded);
     InitRainDrops();
-
-
 }
 
-// Псевдо-случайные числа без <random> (достаточно для визуала)
+// ─────────────────────────────────────────────────────────────────────────────
+// RandF — простой xorshift-генератор без <random>, достаточно для визуала.
+// ─────────────────────────────────────────────────────────────────────────────
 static float RandF(float lo, float hi)
 {
-    static unsigned s = 0x12345678u;
+    static unsigned s = 0x2F6E2B1u;
     s ^= s << 13; s ^= s >> 17; s ^= s << 5;
     return lo + (s & 0xFFFFu) / 65535.f * (hi - lo);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// InitRainDrops — расставляет летящие капли дождя в случайных точках над
+// полом Sponza (Y=0). Вызывается один раз из InitLights().
+// ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::InitRainDrops()
 {
-    // Sponza floor XZ: X ~ [-550, 550], Z ~ [-80, 80]
     for (int i = 0; i < kRainDrops; ++i)
     {
         auto& d = m_rainDrops[i];
-        d.x = RandF(-500.f, 500.f);
-        d.z = RandF(-70.f, 70.f);
-        // Стартуем в разных фазах, чтобы не всё разом падало
-        d.y = RandF(kFloorY + 10.f, kSpawnHeight);
-        d.speed = RandF(80.f, 220.f);
+        d.x      = RandF(-500.f, 500.f);
+        d.z      = RandF(-70.f,  70.f);
+        // Разные стартовые высоты — чтобы капли не падали синхронно
+        d.y      = RandF(kFloorY + 10.f, kSpawnHeight);
+        d.speed  = RandF(80.f, 220.f);
         d.landed = false;
         d.r = RandF(0.2f, 1.0f);
         d.g = RandF(0.2f, 1.0f);
         d.b = RandF(0.4f, 1.0f);
     }
-    m_numLanded = 0;
-    std::memset(m_landedDrops, 0, sizeof(m_landedDrops));
+    m_landedDrops.clear();
+    m_landedWriteIdx = 0;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// UpdateRain — продвигает падающие капли на dt секунд. Когда капля достигает
+// пола (Y <= kFloorY), она:
+//   1) добавляется в m_landedDrops НАВСЕГДА (преподаватель просил, чтобы
+//      источники не пропадали) — пока вектор не заполнится до kRainLanded,
+//      затем используется кольцевой буфер (вытесняет самые старые "лужицы");
+//   2) перезапускается сверху с новыми случайными x/z/цветом/скоростью.
+//
+// Заполняет m_lights[] начиная с m_numBaseLights:
+//   m_numBaseLights .. +m_landedDrops.size()-1   — "лужицы" на полу (постоянные)
+//   далее ..  +kRainDrops-1                       — летящие капли
+// ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::UpdateRain(float dt)
 {
-    // kMaxLights = 16. Статических 8, значит для дождя остаётся 8 слотов.
-    // Слоты [m_numBaseLights .. kMaxLights-1]
-    const int maxRainSlots = kMaxLights - m_numBaseLights;
-
-    // Сбросим «дождевые» слоты — заполним заново ниже
     m_numLights = m_numBaseLights;
 
     auto addLight = [&](float x, float y, float z,
-        float r, float g, float b,
-        float range, float intensity)
-        {
-            if (m_numLights >= kMaxLights) return;
-            auto& L = m_lights[m_numLights++];
-            L.Type = 1;
-            L.Position = { x, y, z };
-            L.Range = range;
-            L.Color = { r, g, b, intensity };
-        };
-
-    // 1. «Лужицы» на полу — стабильные слабые источники
-    for (int i = 0; i < m_numLanded; ++i)
+                         float r, float g, float b,
+                         float range, float intensity)
     {
-        auto& d = m_landedDrops[i];
-        // Лужица: маленький радиус, умеренная яркость
-        addLight(d.x, kFloorY + 1.f, d.z,
-            d.r, d.g, d.b, 330.f, 1.2f);
-    }
+        if (m_numLights >= kMaxLights) return;
+        auto& L = m_lights[m_numLights++];
+        L.Type      = 1; // Point
+        L.Position  = { x, y, z };
+        L.Range     = range;
+        L.Color     = { r, g, b, intensity };
+    };
 
-    // 2. Падающие капли — летят, при приземлении уходят в «лужицы»
+    // 1. "Лужицы" на полу — остаются навсегда (накапливаются)
+    for (auto& d : m_landedDrops)
+        addLight(d.x, kFloorY + 1.f, d.z,
+                 d.r, d.g, d.b, /*range*/ 100.f, /*intensity*/ 0.46f);
+
+    // 2. Летящие капли
     for (int i = 0; i < kRainDrops; ++i)
     {
         auto& d = m_rainDrops[i];
-        if (d.landed) continue;
 
         d.y -= d.speed * dt;
 
         if (d.y <= kFloorY)
         {
-            d.y = kFloorY;
-            d.landed = true;
+            d.y      = kFloorY;
 
-            // Добавить в список лужиц (круговой буфер)
-            m_landedDrops[m_numLanded % kRainLanded] = d;
-            m_numLanded = (std::min)(m_numLanded + 1, kRainLanded);
+            // Сохраняем как постоянную "лужицу" на полу
+            if ((int)m_landedDrops.size() < kRainLanded)
+            {
+                m_landedDrops.push_back(d);
+            }
+            else
+            {
+                // Кольцевой буфер: вытесняем самую старую лужицу
+                m_landedDrops[m_landedWriteIdx] = d;
+                m_landedWriteIdx = (m_landedWriteIdx + 1) % kRainLanded;
+            }
 
-            // Перезапустить каплю сверху
-            d.x = RandF(-500.f, 500.f);
-            d.z = RandF(-70.f, 70.f);
-            d.y = kSpawnHeight;
+            // Перезапускаем каплю сверху с новыми параметрами
+            d.x     = RandF(-500.f, 500.f);
+            d.z     = RandF(-330.f,  250.f);
+            d.y     = kSpawnHeight;
             d.speed = RandF(80.f, 220.f);
-            d.landed = false;
             d.r = RandF(0.2f, 1.0f);
             d.g = RandF(0.2f, 1.0f);
             d.b = RandF(0.4f, 1.0f);
         }
 
-        // Падающая капля светит ярче и с чуть большим радиусом
         addLight(d.x, d.y, d.z,
-            d.r, d.g, d.b, 420.f, 2.0f);
+                 d.r, d.g, d.b, /*range*/ 50.f, /*intensity*/ 0.6f);
     }
 }
+
 // ─────────────────────────────────────────────────────────────────────────────
-// UpdateLightingCB — обновляет LightingConstants каждый кадр.
+// UpdateLightingCB — обновляет LightingConstants (без массива источников)
+// и записывает текущий массив источников в StructuredBuffer (m_lightsBuffer).
+// Constant buffer слишком мал для 200 источников — поэтому источники
+// хранятся отдельно и читаются в шейдере как StructuredBuffer<Light> t4.
 // ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::UpdateLightingCB()
 {
@@ -229,11 +268,11 @@ void RenderingSystem::UpdateLightingCB()
     lc.ScreenSize = { (float)m_width, (float)m_height };
     lc.NumLights  = m_numLights;
 
-    // Копируем массив источников света
-    for (int i = 0; i < m_numLights; ++i)
-        lc.Lights[i] = m_lights[i];
-
     std::memcpy(m_mappedLightingCB, &lc, sizeof(lc));
+
+    // Записываем источники света в structured buffer (upload heap, t4)
+    if (m_mappedLightsBuffer)
+        std::memcpy(m_mappedLightsBuffer, m_lights, (size_t)m_numLights * sizeof(Light));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -345,8 +384,10 @@ void RenderingSystem::LightingPass()
     ID3D12DescriptorHeap* heaps[] = { m_cbvSrvHeap.Get() };
     m_cmdList->SetDescriptorHeaps(1, heaps);
 
-    // param[0]: таблица из 4 SRV начиная со слота 2N (albedo, normal, specular, depth)
-    // GetFirstSRV() возвращает GPU-хендл на слот 2N в куче
+    // param[0]: таблица из 5 SRV начиная со слота 2N
+    //   (albedo, normal, specular, depth, StructuredBuffer<Light> источников)
+    // GetFirstSRV() возвращает GPU-хендл на слот 2N в куче — root signature
+    // расширен до 5 последовательных SRV (t0..t4), поэтому ничего менять не нужно
     m_cmdList->SetGraphicsRootDescriptorTable(0, m_gbuffer.GetFirstSRV());
 
     // param[1]: inline CBV — GPU-адрес lighting CB напрямую (не через таблицу!)
@@ -370,26 +411,24 @@ void RenderingSystem::Draw()
 {
     if (!m_initialized) return;
 
-    // Обновляем оба CB на CPU (mapped memory — нет копирования, GPU читает напрямую)
-    for (int i = 0; i < (int)m_numMaterials; ++i)
-        UpdateMaterialCB(i);
-
-    // ── Delta-time для симуляции дождя ───────────────────────────────────
-    if (!m_rainTimerInited) {
+    // ── Delta-time для симуляции дождя (независимо от geometry-таймера) ──
+    if (!m_rainTimerInited)
+    {
         QueryPerformanceFrequency(&m_rainFreq);
         QueryPerformanceCounter(&m_rainPrev);
         m_rainTimerInited = true;
     }
     LARGE_INTEGER rainNow;
     QueryPerformanceCounter(&rainNow);
-    float rainDt = (float)((rainNow.QuadPart - m_rainPrev.QuadPart)
-        / (double)m_rainFreq.QuadPart);
+    float rainDt = (float)((rainNow.QuadPart - m_rainPrev.QuadPart) / (double)m_rainFreq.QuadPart);
     m_rainPrev = rainNow;
-    rainDt = (std::min)(rainDt, 0.1f); // clamp: при отладочных паузах не прыгать
+    rainDt = (std::min)(rainDt, 0.1f); // clamp — избегаем скачков при паузах в отладчике
 
     UpdateRain(rainDt);
-    // ─────────────────────────────────────────────────────────────────────
 
+    // Обновляем оба CB на CPU (mapped memory — нет копирования, GPU читает напрямую)
+    for (int i = 0; i < (int)m_numMaterials; ++i)
+        UpdateMaterialCB(i);
     UpdateLightingCB();
 
     // Сбрасываем аллокатор и list

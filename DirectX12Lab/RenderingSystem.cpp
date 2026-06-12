@@ -359,7 +359,8 @@ bool RenderingSystem::BuildGeometry()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Два константных буфера: geometry CB (N материалов) + lighting CB (1 слот)
+// Geometry CB (N материалов) + lighting CB (1 слот, без массива источников)
+// + StructuredBuffer источников света (до kMaxLights = 200, для дождя)
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildConstantBuffers()
 {
@@ -374,7 +375,8 @@ bool RenderingSystem::BuildConstantBuffers()
         D3D12_RANGE rr{0,0};
         ThrowIfFailed(m_objectCB->Map(0, &rr, reinterpret_cast<void**>(&m_mappedObjectCB)), "Map Obj CB");
     }
-    // Lighting CB (один слот — всегда aligned)
+    // Lighting CB (один слот — всегда aligned). Теперь без массива источников —
+    // только матрицы/счётчик; сами источники в m_lightsBuffer (structured buffer).
     {
         UINT64 total = AlignCB(sizeof(LightingConstants));
         auto up = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
@@ -383,6 +385,18 @@ bool RenderingSystem::BuildConstantBuffers()
             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_lightingCB)), "Create Light CB");
         D3D12_RANGE rr{0,0};
         ThrowIfFailed(m_lightingCB->Map(0, &rr, reinterpret_cast<void**>(&m_mappedLightingCB)), "Map Light CB");
+    }
+    // StructuredBuffer источников света — upload heap, читается как SRV t4.
+    // 200 * 64 байта = 12800 байт. Заменяет constant-buffer массив, который
+    // был ограничен 16 элементами — теперь лимит практически отсутствует.
+    {
+        UINT64 total = (UINT64)kMaxLights * kLightStride;
+        auto up = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        auto bd = BufDesc(total);
+        ThrowIfFailed(m_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_lightsBuffer)), "Create Lights SB");
+        D3D12_RANGE rr{0,0};
+        ThrowIfFailed(m_lightsBuffer->Map(0, &rr, reinterpret_cast<void**>(&m_mappedLightsBuffer)), "Map Lights SB");
     }
     return true;
 }
@@ -393,15 +407,16 @@ bool RenderingSystem::BuildConstantBuffers()
 //   [N..2N-1]  SRV текстур материалов
 //   [2N..2N+2] SRV G-Buffer (через GBuffer::Create)
 //   [2N+3]     SRV глубины (через RecreateDepthSRV)
+//   [2N+4]     SRV StructuredBuffer<Light> — источники света (дождь и др.)
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildDescriptorViews()
 {
     const uint32_t N = m_numMaterials;
 
-    // Размер кучи: 2N (материалы) + 3 (GBuffer) + 1 (depth)
+    // Размер кучи: 2N (материалы) + 3 (GBuffer) + 1 (depth) + 1 (lights SB)
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
-        hd.NumDescriptors = 2 * N + 4;
+        hd.NumDescriptors = 2 * N + 5;
         hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ThrowIfFailed(m_device->CreateDescriptorHeap(&hd,
@@ -450,6 +465,24 @@ bool RenderingSystem::BuildDescriptorViews()
     // ── SRV глубины [2N+3] ────────────────────────────────────────────────
     RecreateDepthSRV();
 
+    // ── SRV StructuredBuffer<Light> [2N+4] ──────────────────────────────────
+    // Источники света (дождь + статичные) — читаются в lighting pass как t4.
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_cbvSrvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)((2 * N + 4) * m_cbvSrvDescriptorSize);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvd{};
+        srvd.Format                     = DXGI_FORMAT_UNKNOWN;
+        srvd.ViewDimension               = D3D12_SRV_DIMENSION_BUFFER;
+        srvd.Shader4ComponentMapping     = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvd.Buffer.FirstElement         = 0;
+        srvd.Buffer.NumElements          = kMaxLights;
+        srvd.Buffer.StructureByteStride  = kLightStride;
+        srvd.Buffer.Flags                = D3D12_BUFFER_SRV_FLAG_NONE;
+
+        m_device->CreateShaderResourceView(m_lightsBuffer.Get(), &srvd, h);
+    }
+
     return true;
 }
 
@@ -497,15 +530,16 @@ bool RenderingSystem::BuildRootSignatures()
     }
 
     // ── Lighting ──────────────────────────────────────────────────────────
-    // param[0] — descriptor table: 4 SRV  (t0-t3): albedo, normal, specular, depth
+    // param[0] — descriptor table: 5 SRV (t0-t4): albedo, normal, specular,
+    //            depth, и StructuredBuffer<Light> (источники света / дождь)
     // param[1] — inline root CBV (b0): LightingConstants (без слота в куче!)
     // static sampler s0: POINT CLAMP (для точного чтения пикселей)
     {
         D3D12_DESCRIPTOR_RANGE srvRange{};
-        srvRange = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+        srvRange = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
 
         D3D12_ROOT_PARAMETER params[2]{};
-        // Таблица 4 SRV
+        // Таблица 5 SRV (t0..t4)
         params[0].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[0].DescriptorTable  = { 1, &srvRange };
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;

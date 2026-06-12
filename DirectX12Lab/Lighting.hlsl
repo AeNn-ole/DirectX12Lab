@@ -22,13 +22,18 @@ struct Light
 };
 
 // ── Lighting CB ───────────────────────────────────────────────────────────────
+// Источники света больше НЕ хранятся здесь — constant buffer слишком мал
+// для большого количества источников (дождь из 200 точечных огней).
 cbuffer LightingCB : register(b0)
 {
     float4x4 gInvViewProj;
     float3   gEyePosW;    float _p0;
     float2   gScreenSize; int gNumLights; float _p1;
-    Light    gLights[16];
 };
+
+// Источники света — StructuredBuffer (t4), читается напрямую из памяти,
+// размер не ограничен constant buffer'ом (16 источников было слишком мало).
+StructuredBuffer<Light> gLights : register(t4);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Реконструкция мировой позиции из UV и глубины
