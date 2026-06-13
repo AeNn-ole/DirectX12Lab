@@ -22,12 +22,6 @@ static void ThrowIfFailed2(HRESULT hr, const char* what)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// НОВОЕ: BuildOctree — вызывается один раз после ScatterInstances().
-//
-// Собирает Octree::Entry (idx + center + radius) для каждого экземпляра
-// и передаёт в Octree::Build(). Дерево строится по центрам ограничивающих
-// сфер (m_instances[i].Center, .Radius), которые вычислены в ScatterInstances.
-// ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::BuildOctree()
 {
     std::vector<Octree::Entry> entries;
@@ -38,32 +32,13 @@ void RenderingSystem::BuildOctree()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// НОВОЕ: CollectVisibleInstances — выбирает какие экземпляры рисовать.
-//
-// Три режима зависят от флагов:
-//
-//   1. Culling выкл → все N_inst экземпляров (m_visibleIndices = 0,1,...,N-1)
-//
-//   2. Frustum culling вкл, Octree выкл →
-//      Линейный обход всех экземпляров: IsSphereInFrustum() на каждый.
-//      O(N) — для 2500 объектов ~быстро, но с ростом числа масштабируется плохо.
-//
-//   3. Frustum culling вкл, Octree вкл →
-//      Octree::Query() — рекурсивный обход с ранним отсечением целых узлов.
-//      O(log N × видимых) — принципиально быстрее для плотных сцен.
-//
-// После вызова m_visibleIndices содержит индексы экземпляров для этого кадра.
-// ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::CollectVisibleInstances()
 {
     m_visibleIndices.clear();
 
-    // Отдаём приоритет octree, если он включён и построен
     if (m_octreeCullingEnabled && m_octree.IsBuilt())
     {
         m_octree.Query(m_frustumPlanes, m_visibleIndices);
-
-        // Точная проверка сферами
         m_visibleIndices.erase(
             std::remove_if(m_visibleIndices.begin(), m_visibleIndices.end(),
                 [this](int i) {
@@ -74,14 +49,12 @@ void RenderingSystem::CollectVisibleInstances()
     }
     else if (!m_frustumCullingEnabled)
     {
-        // Без фрустум‑куллинга — рисуем всё
         m_visibleIndices.resize(m_instances.size());
         for (int i = 0; i < (int)m_instances.size(); ++i)
             m_visibleIndices[i] = i;
     }
     else
     {
-        // Линейный фрустум‑куллинг
         for (int i = 0; i < (int)m_instances.size(); ++i)
         {
             if (IsSphereInFrustum(m_frustumPlanes,
@@ -133,8 +106,16 @@ void RenderingSystem::UpdateMaterialCB(int mi)
     cb.Specular  = { mat.Ks.x, mat.Ks.y, mat.Ks.z, 1.f };
     cb.SpecPower = mat.Ns > 0.f ? mat.Ns : 32.f;
     cb.gTime     = m_totalTime;
-    cb.UVOffset  = { m_totalTime * 0.02f, 0.f };
+    cb.UVOffset  = { 0.f, 0.f };  // убрали анимацию UV — она мешает displacement
     cb.UVTiling  = { 1.f, 1.f };
+
+    // Параметры тесселяции из CPU-состояния
+    cb.TessFactorNear    = m_tessellationEnabled ? m_tessFactorNear : 1.f;
+    cb.TessFactorFar     = m_tessellationEnabled ? m_tessFactorFar  : 1.f;
+    cb.TessDistNear      = m_tessDistNear;
+    cb.TessDistFar       = m_tessDistFar;
+    cb.DisplacementScale = m_tessellationEnabled ? m_displacementScale : 0.f;
+    cb.EnableNormalMap   = m_normalMappingEnabled ? 1 : 0;
 
     std::memcpy(m_mappedMaterialCB + (size_t)mi * m_materialCBByteSize,
                 &cb, sizeof(cb));
@@ -175,8 +156,6 @@ void RenderingSystem::UpdateLightingCB()
     XMVECTOR det;
     XMMATRIX invVP = XMMatrixInverse(&det, viewProj);
 
-    // ── НОВОЕ: обновляем плоскости фрустума ────────────────────────────
-    // ViewProj НЕ транспонирован — ExtractFrustumPlanes ожидает CPU-конвенцию
     XMFLOAT4X4 vpf; XMStoreFloat4x4(&vpf, viewProj);
     m_frustumPlanes = ExtractFrustumPlanes(vpf);
 
@@ -191,31 +170,49 @@ void RenderingSystem::UpdateLightingCB()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ИЗМЕНЕНО: GeometryPass — использует m_visibleIndices вместо всех экземпляров.
+// GeometryPass
 //
-// CollectVisibleInstances() уже заполнила m_visibleIndices нужными индексами.
-// Здесь просто итерируемся по ним — GeometryPass не знает о режиме culling,
-// он всегда получает готовый список видимых объектов.
+// Ключевые изменения по сравнению с предыдущей версией:
+//   1. Топология: D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST
+//      (каждые 3 индекса = один патч для HS)
+//   2. Привязываем normal map (param[3]) и displacement map (param[4])
+//      для каждого subMesh
 // ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::GeometryPass()
 {
-    m_gbuffer.TransitionToRenderTarget(m_cmdList.Get());
+    // ── Wireframe mode: рисуем прямо в back buffer, минуя G-Buffer ───────
+    if (m_wireframe)
+    {
+        auto rtv = CurrentBackBufferRTV();
+        auto dsv = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        m_cmdList->OMSetRenderTargets(1, &rtv, TRUE, &dsv);
+        const float black[4] = {0.05f, 0.05f, 0.05f, 1.f};
+        m_cmdList->ClearRenderTargetView(rtv, black, 0, nullptr);
+        m_cmdList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.f, 0, 0, nullptr);
+        m_cmdList->SetPipelineState(m_geometryWirePSO.Get());
+    }
+    else
+    {
+        m_gbuffer.TransitionToRenderTarget(m_cmdList.Get());
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvs[3] = {
-        m_gbuffer.GetRTV(GBuffer::Albedo),
-        m_gbuffer.GetRTV(GBuffer::Normal),
-        m_gbuffer.GetRTV(GBuffer::Specular),
-    };
-    auto dsv = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
-    m_cmdList->OMSetRenderTargets(3, rtvs, FALSE, &dsv);
-    m_gbuffer.Clear(m_cmdList.Get());
-    m_cmdList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.f, 0, 0, nullptr);
-
-    m_cmdList->SetPipelineState(m_geometryPSO.Get());
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvs[3] = {
+            m_gbuffer.GetRTV(GBuffer::Albedo),
+            m_gbuffer.GetRTV(GBuffer::Normal),
+            m_gbuffer.GetRTV(GBuffer::Specular),
+        };
+        auto dsv = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        m_cmdList->OMSetRenderTargets(3, rtvs, FALSE, &dsv);
+        m_gbuffer.Clear(m_cmdList.Get());
+        m_cmdList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.f, 0, 0, nullptr);
+        m_cmdList->SetPipelineState(m_geometryPSO.Get());
+    }
     m_cmdList->SetGraphicsRootSignature(m_geometryRootSig.Get());
     m_cmdList->RSSetViewports(1, &m_viewport);
     m_cmdList->RSSetScissorRects(1, &m_scissorRect);
-    m_cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    // Тесселяция: 3-control-point patches (треугольники)
+    m_cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+
     m_cmdList->IASetVertexBuffers(0, 1, &m_vbv);
     m_cmdList->IASetIndexBuffer(&m_ibv);
 
@@ -226,11 +223,10 @@ void RenderingSystem::GeometryPass()
         m_cbvSrvHeap->GetGPUDescriptorHandleForHeapStart();
     const uint32_t N = m_numMaterials;
 
-    // Материальные CB обновляем один раз за кадр
+    // Обновляем материальные CB один раз за кадр
     for (uint32_t mi = 0; mi < N; ++mi)
         UpdateMaterialCB((int)mi);
 
-    // Внешний цикл — только ВИДИМЫЕ экземпляры
     for (int i : m_visibleIndices)
     {
         UpdateInstanceCB(i);
@@ -244,19 +240,32 @@ void RenderingSystem::GeometryPass()
         {
             int mi = sub.materialIndex;
 
+            // param[1]: PerMaterialCB [0..N-1]
             D3D12_GPU_DESCRIPTOR_HANDLE cbvH = gpuBase;
             cbvH.ptr += (SIZE_T)((uint32_t)mi * m_cbvSrvDescriptorSize);
             m_cmdList->SetGraphicsRootDescriptorTable(1, cbvH);
 
-            D3D12_GPU_DESCRIPTOR_HANDLE srvH = gpuBase;
-            srvH.ptr += (SIZE_T)((N + (uint32_t)mi) * m_cbvSrvDescriptorSize);
-            m_cmdList->SetGraphicsRootDescriptorTable(2, srvH);
+            // param[2]: albedo [N..2N-1]
+            D3D12_GPU_DESCRIPTOR_HANDLE albedoH = gpuBase;
+            albedoH.ptr += (SIZE_T)((N + (uint32_t)mi) * m_cbvSrvDescriptorSize);
+            m_cmdList->SetGraphicsRootDescriptorTable(2, albedoH);
+
+            // param[3]: normal map [2N..3N-1]
+            D3D12_GPU_DESCRIPTOR_HANDLE normalH = gpuBase;
+            normalH.ptr += (SIZE_T)((2 * N + (uint32_t)mi) * m_cbvSrvDescriptorSize);
+            m_cmdList->SetGraphicsRootDescriptorTable(3, normalH);
+
+            // param[4]: displacement [3N..4N-1]
+            D3D12_GPU_DESCRIPTOR_HANDLE dispH = gpuBase;
+            dispH.ptr += (SIZE_T)((3 * N + (uint32_t)mi) * m_cbvSrvDescriptorSize);
+            m_cmdList->SetGraphicsRootDescriptorTable(4, dispH);
 
             m_cmdList->DrawIndexedInstanced(sub.indexCount, 1, sub.indexStart, 0, 0);
         }
     }
 
-    m_gbuffer.TransitionToShaderResource(m_cmdList.Get());
+    if (!m_wireframe)
+        m_gbuffer.TransitionToShaderResource(m_cmdList.Get());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -296,17 +305,11 @@ void RenderingSystem::LightingPass()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ИЗМЕНЕНО: Draw — перед GeometryPass вызывает CollectVisibleInstances().
-// UpdateLightingCB теперь также обновляет m_frustumPlanes.
-// ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::Draw()
 {
     if (!m_initialized) return;
 
-    // 1. Обновить матрицы + извлечь плоскости фрустума
     UpdateLightingCB();
-
-    // 2. Отобрать видимые экземпляры (режим зависит от флагов)
     CollectVisibleInstances();
 
     ThrowIfFailed2(m_cmdAlloc->Reset(), "Alloc Draw");
@@ -321,7 +324,7 @@ void RenderingSystem::Draw()
     m_cmdList->ResourceBarrier(1, &toRT);
 
     GeometryPass();
-    LightingPass();
+    if (!m_wireframe) LightingPass();
 
     D3D12_RESOURCE_BARRIER toPresent = toRT;
     toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -366,7 +369,7 @@ void RenderingSystem::OnResize(uint32_t width, uint32_t height)
     CreateDepthStencil();
     m_gbuffer.Create(m_device.Get(), width, height,
         m_rtvHeap.Get(), kSwapChainBufferCount, m_rtvDescriptorSize,
-        m_cbvSrvHeap.Get(), 2 * m_numMaterials, m_cbvSrvDescriptorSize);
+        m_cbvSrvHeap.Get(), 4 * m_numMaterials, m_cbvSrvDescriptorSize);
     RecreateDepthSRV();
 
     m_viewport    = { 0, 0, (float)width, (float)height, 0, 1 };
@@ -400,7 +403,11 @@ ID3D12Resource* RenderingSystem::CurrentBackBuffer() const
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LoadAndUploadTexture — без изменений
+// LoadAndUploadTexture
+// Если файл не найден — генерируем заглушку:
+//   - для normal map: сплошной {128, 128, 255} (нормаль (0,0,1) в tangent space)
+//   - для displacement: сплошной серый {128} (нулевое смещение)
+//   - для albedo: шахматная текстура
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::LoadAndUploadTexture(const wchar_t* path,
     ComPtr<ID3D12Resource>& outTex)
@@ -419,15 +426,36 @@ bool RenderingSystem::LoadAndUploadTexture(const wchar_t* path,
         pixels.assign(data, data + texW*texH*4);
         stbi_image_free(data);
     } else {
-        texW = texH = 64;
-        pixels.resize(texW*texH*4);
-        for (uint32_t y = 0; y < texH; ++y)
-            for (uint32_t x = 0; x < texW; ++x) {
-                bool w2 = ((x/8)+(y/8))%2==0;
-                uint32_t idx=(y*texW+x)*4;
-                pixels[idx+0]=w2?255u:50u; pixels[idx+1]=w2?255u:200u;
-                pixels[idx+2]=w2?255u:50u; pixels[idx+3]=255u;
+        // Определяем тип заглушки по имени файла
+        std::string p(pathA);
+        texW = texH = 4;
+        pixels.resize(texW * texH * 4);
+
+        bool isNormal = (p.find("normal") != std::string::npos ||
+                         p.find("bump")   != std::string::npos ||
+                         p.find("_n.")    != std::string::npos);
+        bool isDisp   = (p.find("disp")   != std::string::npos ||
+                         p.find("height") != std::string::npos ||
+                         p.find("_h.")    != std::string::npos ||
+                         p.find("_default") != std::string::npos);
+
+        for (uint32_t pi = 0; pi < texW * texH; ++pi) {
+            if (isNormal) {
+                // (0, 0, 1) в tangent space → (128, 128, 255)
+                pixels[pi*4+0] = 128; pixels[pi*4+1] = 128;
+                pixels[pi*4+2] = 255; pixels[pi*4+3] = 255;
+            } else if (isDisp) {
+                // Нулевой дисплейсмент — средний серый
+                pixels[pi*4+0] = pixels[pi*4+1] = pixels[pi*4+2] = 0;
+                pixels[pi*4+3] = 255;
+            } else {
+                // Шахматная текстура для albedo
+                uint32_t y2 = pi / texW, x2 = pi % texW;
+                bool wh = ((x2/2)+(y2/2))%2==0;
+                pixels[pi*4+0] = wh?255u:50u; pixels[pi*4+1] = wh?255u:200u;
+                pixels[pi*4+2] = wh?255u:50u; pixels[pi*4+3] = 255u;
             }
+        }
     }
 
     D3D12_RESOURCE_DESC td{};

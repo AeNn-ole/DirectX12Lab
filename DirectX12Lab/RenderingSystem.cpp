@@ -14,8 +14,6 @@ using namespace DirectX;
 using Microsoft::WRL::ComPtr;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Утилиты (без изменений)
-// ─────────────────────────────────────────────────────────────────────────────
 static void ThrowIfFailed(HRESULT hr, const char* what)
 {
     if (FAILED(hr)) {
@@ -87,8 +85,6 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     XMStoreFloat4x4(&m_view, XMMatrixLookAtLH(eye, XMVectorZero(), XMVectorSet(0,1,0,0)));
     float asp = height > 0 ? (float)width / height : 1.f;
     XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, asp, 0.1f, 5000.f));
-    //                                                        дальняя плоскость увеличена ↑
-    //                                                        100 экземпляров требуют дальнего видения
 
     // ── Загрузка модели ───────────────────────────────────────────────────
     if (!LoadObj(L"model.obj", m_model))
@@ -101,10 +97,9 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
 
     m_numMaterials = (uint32_t)m_model.materials.size();
 
-    // ── НОВОЕ: вычислить AABB модели и разбросать экземпляры ─────────────
     ComputeModelBounds();
     ScatterInstances();
-    BuildOctree();   // строим дерево сразу после расстановки
+    BuildOctree();
 
     BuildShaders();
     BuildGeometry();
@@ -118,9 +113,6 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// НОВОЕ: вычисляем AABB по всем вершинам модели.
-// Центр и радиус используются в ScatterInstances (и в задании 2 для culling).
 // ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::ComputeModelBounds()
 {
@@ -139,54 +131,25 @@ void RenderingSystem::ComputeModelBounds()
     XMVECTOR center = XMVectorScale(XMVectorAdd(vmin, vmax), 0.5f);
     XMStoreFloat3(&m_modelCenter, center);
 
-    // Радиус = половина диагонали AABB (консервативная, но быстрая оценка)
     XMVECTOR halfDiag = XMVectorScale(XMVectorSubtract(vmax, vmin), 0.5f);
     m_modelRadius = XMVectorGetX(XMVector3Length(halfDiag));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// НОВОЕ: создаём kMaxInstances экземпляров сеткой 10×10.
-//
-// Шаг между объектами = diameter * 1.5 — достаточно места чтобы не слипались,
-// но достаточно плотно чтобы эффект был виден.
-//
-// Массив m_instances на CPU. GPU-память выделена в BuildConstantBuffers.
+// ScatterInstances — теперь создаёт ровно ОДИН инстанс модели (Identity).
+// Octree/frustum culling остаются в коде (полезны при многих subMesh-ах
+// у Sponza), ноculling-сетка инстансов больше не нужна.
 // ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::ScatterInstances()
 {
     m_instances.clear();
-    m_instances.reserve(kMaxInstances);
 
-    const int   side    = (int)std::sqrtf((float)kMaxInstances); // 10
-    const float spacing = m_modelRadius * 2.f * 1.5f;            // 1.5× диаметр
+    InstanceData d{};
+    XMStoreFloat4x4(&d.World, XMMatrixIdentity());
+    d.Center = m_modelCenter;
+    d.Radius = m_modelRadius;
 
-    // Сдвигаем сетку так чтобы центр был у начала координат
-    const float offset = -spacing * (side - 1) * 0.5f;
-
-    for (int z = 0; z < side; ++z)
-    {
-        for (int x = 0; x < side; ++x)
-        {
-            InstanceData d{};
-
-            float wx = offset + x * spacing;
-            float wz = offset + z * spacing;
-
-            // Матрица перемещения (масштаб и поворот при желании добавить сюда же)
-            XMMATRIX T = XMMatrixTranslation(wx, 0.f, wz);
-            XMStoreFloat4x4(&d.World, T);
-
-            // Центр ограничивающей сферы в мировых координатах
-            d.Center = {
-                wx + m_modelCenter.x,
-                m_modelCenter.y,
-                wz + m_modelCenter.z
-            };
-            d.Radius = m_modelRadius;
-
-            m_instances.push_back(d);
-        }
-    }
+    m_instances.push_back(d);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -203,8 +166,6 @@ void RenderingSystem::Shutdown()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Без изменений
-// ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::CreateDevice()
 {
     HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&m_device));
@@ -214,6 +175,14 @@ bool RenderingSystem::CreateDevice()
         ThrowIfFailed(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_12_0,
             IID_PPV_ARGS(&m_device)), "D3D12CreateDevice WARP");
     }
+
+    // Проверяем поддержку тесселяции (обязательна начиная с D3D_FEATURE_LEVEL_11_0)
+    D3D12_FEATURE_DATA_D3D12_OPTIONS opts{};
+    if (FAILED(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof(opts))))
+        OutputDebugStringA("CheckFeatureSupport failed\n");
+    // Tessellation всегда доступна на FL 11+, просто логируем
+    OutputDebugStringA("Device created. Tessellation supported (FL12_0).\n");
+
     return true;
 }
 
@@ -320,11 +289,14 @@ bool RenderingSystem::CreateDepthStencil()
     return true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Depth SRV находится по смещению [4N+3] в куче
+// ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::RecreateDepthSRV()
 {
     const uint32_t N = m_numMaterials;
     D3D12_CPU_DESCRIPTOR_HANDLE h = m_cbvSrvHeap->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += (SIZE_T)((2 * N + 3) * m_cbvSrvDescriptorSize);
+    h.ptr += (SIZE_T)((4 * N + 3) * m_cbvSrvDescriptorSize);
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srvd{};
     srvd.Format                  = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
@@ -354,17 +326,26 @@ bool RenderingSystem::BuildShaders()
         }
     };
 
-    compile(L"GBuffer.hlsl",  "VSMain",       "vs_5_0", m_gbVS);
-    compile(L"GBuffer.hlsl",  "PSMain",        "ps_5_0", m_gbPS);
-    compile(L"Lighting.hlsl", "VSMain_Light",  "vs_5_0", m_lightVS);
-    compile(L"Lighting.hlsl", "PSMain_Light",  "ps_5_0", m_lightPS);
+    // Geometry pass: VS + HS + DS + PS
+    compile(L"GBuffer.hlsl", "VSMain",       "vs_5_0", m_gbVS);
+    compile(L"GBuffer.hlsl", "HSMain",       "hs_5_0", m_gbHS);
+    compile(L"GBuffer.hlsl", "DSMain",       "ds_5_0", m_gbDS);
+    compile(L"GBuffer.hlsl", "PSMain",       "ps_5_0", m_gbPS);
 
+    // Lighting pass
+    compile(L"Lighting.hlsl", "VSMain_Light", "vs_5_0", m_lightVS);
+    compile(L"Lighting.hlsl", "PSMain_Light", "ps_5_0", m_lightPS);
+
+    // Input layout: POSITION, NORMAL, TANGENT, TEXCOORD
+    // Смещения соответствуют ObjVertex: Pos(0), Normal(12), Tangent(24), TexCoord(36)
     m_inputLayout[0] = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     m_inputLayout[1] = { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
-    m_inputLayout[2] = { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+    m_inputLayout[2] = { "TANGENT",  0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+    m_inputLayout[3] = { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 36, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     return true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildGeometry()
 {
     const UINT64 vbBytes = (UINT64)m_model.vertices.size() * sizeof(ObjVertex);
@@ -418,15 +399,8 @@ bool RenderingSystem::BuildGeometry()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ИЗМЕНЕНО: три CB вместо двух.
-//
-//   m_instanceCB  — kMaxInstances слотов × PerInstanceCB (World, WVP, Eye, LightDir)
-//   m_materialCB  — N_mat слотов × PerMaterialCB (Kd, Ks, Ka, Ns, UV)
-//   m_lightingCB  — 1 слот × LightingConstants (без изменений)
-// ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildConstantBuffers()
 {
-    // Instance CB — один слот на каждый экземпляр
     m_instanceCBByteSize = AlignCB(sizeof(PerInstanceCB));
     {
         UINT64 total = (UINT64)kMaxInstances * m_instanceCBByteSize;
@@ -440,7 +414,6 @@ bool RenderingSystem::BuildConstantBuffers()
             reinterpret_cast<void**>(&m_mappedInstanceCB)), "Map Instance CB");
     }
 
-    // Material CB — один слот на каждый материал
     m_materialCBByteSize = AlignCB(sizeof(PerMaterialCB));
     {
         UINT64 total = (UINT64)m_numMaterials * m_materialCBByteSize;
@@ -454,7 +427,6 @@ bool RenderingSystem::BuildConstantBuffers()
             reinterpret_cast<void**>(&m_mappedMaterialCB)), "Map Material CB");
     }
 
-    // Lighting CB (без изменений)
     {
         UINT64 total = AlignCB(sizeof(LightingConstants));
         auto up = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
@@ -470,16 +442,13 @@ bool RenderingSystem::BuildConstantBuffers()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ИЗМЕНЕНО: CBV в куче теперь указывают на m_materialCB (PerMaterialCB),
-// а НЕ на старый ObjectConstants.
-//
-// Раскладка кучи (CBV/SRV, shader-visible):
-//   [0  .. N-1 ]   CBV → m_materialCB слот i          (geometry param[1])
-//   [N  .. 2N-1]   SRV → текстура материала i          (geometry param[2])
-//   [2N .. 2N+2]   SRV → G-Buffer (albedo, norm, spec)  (lighting param[0])
-//   [2N+3]         SRV → глубина                         (lighting param[0]+3)
-//
-// m_instanceCB доступен как inline root CBV (param[0]) — без дескриптора в куче.
+// Раскладка кучи (новая):
+//   [0  .. N-1 ]      CBV → PerMaterialCB
+//   [N  .. 2N-1]      SRV → albedo texture
+//   [2N .. 3N-1]      SRV → normal map
+//   [3N .. 4N-1]      SRV → displacement map
+//   [4N .. 4N+2]      SRV → G-Buffer (3 текстуры)
+//   [4N+3]            SRV → глубина
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildDescriptorViews()
 {
@@ -487,7 +456,7 @@ bool RenderingSystem::BuildDescriptorViews()
 
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
-        hd.NumDescriptors = 2 * N + 4;   // N CBV + N SRV + 3 GBuf + 1 depth
+        hd.NumDescriptors = 4 * N + 4;   // N CBV + N albedo + N normal + N disp + 3 GBuf + 1 depth
         hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ThrowIfFailed(m_device->CreateDescriptorHeap(&hd,
@@ -497,7 +466,7 @@ bool RenderingSystem::BuildDescriptorViews()
     D3D12_CPU_DESCRIPTOR_HANDLE cpuBase =
         m_cbvSrvHeap->GetCPUDescriptorHandleForHeapStart();
 
-    // ── CBV [0..N-1]: указываем на m_materialCB ──────────────────────────
+    // ── CBV [0..N-1] ──────────────────────────────────────────────────────
     for (uint32_t i = 0; i < N; ++i)
     {
         D3D12_CONSTANT_BUFFER_VIEW_DESC cbvd{};
@@ -509,93 +478,130 @@ bool RenderingSystem::BuildDescriptorViews()
         m_device->CreateConstantBufferView(&cbvd, h);
     }
 
-    // ── SRV текстур [N..2N-1] (без изменений) ────────────────────────────
-    m_gpuMaterials.resize(N);
-    for (uint32_t i = 0; i < N; ++i)
+    // Вспомогательная функция создания SRV с заглушкой
+    auto makeSRV = [&](ID3D12Resource* tex, uint32_t heapSlot)
     {
-        const wchar_t* texPath = m_model.materials[i].map_Kd.empty()
-            ? L"texture.png" : m_model.materials[i].map_Kd.c_str();
-        LoadAndUploadTexture(texPath, m_gpuMaterials[i].texture);
-
         D3D12_SHADER_RESOURCE_VIEW_DESC srvd{};
         srvd.Format                  = DXGI_FORMAT_R8G8B8A8_UNORM;
         srvd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
         srvd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srvd.Texture2D.MipLevels     = 1;
         D3D12_CPU_DESCRIPTOR_HANDLE h = cpuBase;
-        h.ptr += (SIZE_T)((N + i) * m_cbvSrvDescriptorSize);
-        m_device->CreateShaderResourceView(m_gpuMaterials[i].texture.Get(), &srvd, h);
+        h.ptr += (SIZE_T)(heapSlot * m_cbvSrvDescriptorSize);
+        m_device->CreateShaderResourceView(tex, &srvd, h);
+    };
+
+    m_gpuMaterials.resize(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const auto& mat = m_model.materials[i];
+
+        // Albedo [N + i]
+        const wchar_t* albedoPath = mat.map_Kd.empty() ? L"texture.png" : mat.map_Kd.c_str();
+        LoadAndUploadTexture(albedoPath, m_gpuMaterials[i].texture);
+        makeSRV(m_gpuMaterials[i].texture.Get(), N + i);
+
+        // Normal map [2N + i]
+        const wchar_t* normalPath = mat.map_Bump.empty() ? L"normal_default.png" : mat.map_Bump.c_str();
+        LoadAndUploadTexture(normalPath, m_gpuMaterials[i].normalMap);
+        makeSRV(m_gpuMaterials[i].normalMap.Get(), 2 * N + i);
+
+        // Displacement map [3N + i]
+        const wchar_t* dispPath = mat.map_Disp.empty() ? L"disp_default.png" : mat.map_Disp.c_str();
+        LoadAndUploadTexture(dispPath, m_gpuMaterials[i].dispMap);
+        makeSRV(m_gpuMaterials[i].dispMap.Get(), 3 * N + i);
     }
 
-    // ── G-Buffer SRV [2N..2N+2] ───────────────────────────────────────────
+    // ── G-Buffer SRV [4N..4N+2] ───────────────────────────────────────────
     m_gbuffer.Create(m_device.Get(), m_width, m_height,
         m_rtvHeap.Get(), kSwapChainBufferCount, m_rtvDescriptorSize,
-        m_cbvSrvHeap.Get(), 2 * N, m_cbvSrvDescriptorSize);
+        m_cbvSrvHeap.Get(), 4 * N, m_cbvSrvDescriptorSize);
 
-    // ── Depth SRV [2N+3] ─────────────────────────────────────────────────
+    // ── Depth SRV [4N+3] ─────────────────────────────────────────────────
     RecreateDepthSRV();
 
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ИЗМЕНЕНО: Root Signature geometry pass — теперь 3 параметра.
+// Root Signatures
 //
-//   param[0]: inline root CBV  → b0  (PerInstanceCB)
-//             SetGraphicsRootConstantBufferView(0, gpuAddr)
-//             Без слота в куче — самый дешёвый способ передать меняющийся адрес.
+// Geometry pass (новая раскладка):
+//   param[0]: inline CBV  → b0  (PerInstanceCB) — меняется на каждый инстанс
+//   param[1]: table 1×CBV → b1  (PerMaterialCB) — меняется на каждый материал
+//   param[2]: table 1×SRV → t0  (albedo)
+//   param[3]: table 1×SRV → t1  (normal map)
+//   param[4]: table 1×SRV → t2  (displacement map)
+//   s0: wrap sampler (albedo/normal)
+//   s1: point sampler (displacement — для SampleLevel в DS)
 //
-//   param[1]: descriptor table 1×CBV → b1  (PerMaterialCB)
-//             SetGraphicsRootDescriptorTable(1, cbvHandle)
-//
-//   param[2]: descriptor table 1×SRV → t0  (текстура)
-//             SetGraphicsRootDescriptorTable(2, srvHandle)
-//
-// Lighting pass root sig — без изменений.
+// Lighting pass — без изменений.
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildRootSignatures()
 {
     // ── Geometry ──────────────────────────────────────────────────────────
     {
-        // Два диапазона для param[1] и param[2]
-        D3D12_DESCRIPTOR_RANGE ranges[2]{};
-        ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0,   // b1
-                      D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
-        ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,   // t0
-                      D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+        D3D12_DESCRIPTOR_RANGE ranges[4]{};
+        // param[1]: b1 — PerMaterialCB
+        ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+        // param[2]: t0 — albedo
+        ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+        // param[3]: t1 — normal map
+        ranges[2] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+        // param[4]: t2 — displacement
+        ranges[3] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
 
-        D3D12_ROOT_PARAMETER params[3]{};
+        D3D12_ROOT_PARAMETER params[5]{};
 
-        // param[0]: inline CBV → b0 (PerInstanceCB)
-        // Тип DESCRIPTOR: GPU-адрес передаётся напрямую, без дескриптора в куче.
-        // Дешевле дескрипторной таблицы при частой смене (каждый экземпляр).
+        // param[0]: inline CBV → b0
         params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        params[0].Descriptor.ShaderRegister = 0;   // b0
+        params[0].Descriptor.ShaderRegister = 0;
         params[0].Descriptor.RegisterSpace  = 0;
         params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
-        // param[1]: table 1×CBV → b1 (PerMaterialCB)
+        // param[1]: table CBV → b1
         params[1].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable  = { 1, &ranges[0] };
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-        // param[2]: table 1×SRV → t0 (текстура)
+        // param[2]: table SRV → t0 (albedo) — нужен PS
         params[2].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[2].DescriptorTable  = { 1, &ranges[1] };
         params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        D3D12_STATIC_SAMPLER_DESC samp{};
-        samp.Filter         = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        samp.MaxAnisotropy  = 1;
-        samp.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-        samp.MaxLOD         = D3D12_FLOAT32_MAX;
-        samp.ShaderRegister = 0;
-        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        // param[3]: table SRV → t1 (normal map) — нужен PS
+        params[3].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[3].DescriptorTable  = { 1, &ranges[2] };
+        params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        // param[4]: table SRV → t2 (displacement) — нужен DS и PS
+        params[4].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[4].DescriptorTable  = { 1, &ranges[3] };
+        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        // Два статических сэмплера: wrap (s0) и point (s1)
+        D3D12_STATIC_SAMPLER_DESC samplers[2]{};
+        // s0 — wrap, для albedo/normal в PS
+        samplers[0].Filter         = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samplers[0].AddressU = samplers[0].AddressV = samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplers[0].MaxAnisotropy  = 1;
+        samplers[0].ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samplers[0].MaxLOD         = D3D12_FLOAT32_MAX;
+        samplers[0].ShaderRegister = 0;
+        samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        // s1 — point wrap, для displacement в DS (SampleLevel)
+        samplers[1].Filter         = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        samplers[1].AddressU = samplers[1].AddressV = samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplers[1].MaxAnisotropy  = 1;
+        samplers[1].ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samplers[1].MaxLOD         = D3D12_FLOAT32_MAX;
+        samplers[1].ShaderRegister = 1;
+        samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters     = 3; rsd.pParameters = params;
-        rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &samp;
+        rsd.NumParameters     = 5; rsd.pParameters = params;
+        rsd.NumStaticSamplers = 2; rsd.pStaticSamplers = samplers;
         rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ComPtr<ID3DBlob> ser, err;
@@ -643,7 +649,7 @@ bool RenderingSystem::BuildRootSignatures()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BuildPSOs — без изменений (PSO не зависит от разбивки CB)
+// BuildPSOs — geometry PSO с HS+DS, тип топологии PATCH
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildPSOs()
 {
@@ -656,6 +662,7 @@ bool RenderingSystem::BuildPSOs()
     rast.DepthBiasClamp  = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
     rast.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
 
+    // ── Geometry PSO (с тесселяцией) ─────────────────────────────────────
     {
         D3D12_BLEND_DESC blend{};
         for (int i = 0; i < 3; ++i)
@@ -670,13 +677,16 @@ bool RenderingSystem::BuildPSOs()
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature    = m_geometryRootSig.Get();
         pd.VS                = { m_gbVS->GetBufferPointer(), m_gbVS->GetBufferSize() };
+        pd.HS                = { m_gbHS->GetBufferPointer(), m_gbHS->GetBufferSize() };
+        pd.DS                = { m_gbDS->GetBufferPointer(), m_gbDS->GetBufferSize() };
         pd.PS                = { m_gbPS->GetBufferPointer(), m_gbPS->GetBufferSize() };
         pd.BlendState        = blend;
         pd.RasterizerState   = rast;
         pd.DepthStencilState = ds;
         pd.SampleMask        = UINT_MAX;
-        pd.InputLayout       = { m_inputLayout, 3 };
-        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.InputLayout       = { m_inputLayout, 4 };
+        // Тесселяция требует PATCH топологию
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
         pd.NumRenderTargets  = 3;
         pd.RTVFormats[0]     = GBuffer::kFormats[GBuffer::Albedo];
         pd.RTVFormats[1]     = GBuffer::kFormats[GBuffer::Normal];
@@ -686,8 +696,21 @@ bool RenderingSystem::BuildPSOs()
 
         ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pd,
             IID_PPV_ARGS(&m_geometryPSO)), "Create Geometry PSO");
+
+        // ── Wireframe PSO — всё то же самое, только FillMode = WIREFRAME ──
+        // Рендерим в back buffer напрямую (один RT, без G-Buffer),
+        // чтобы видеть сетку тесселяции поверх обычного кадра.
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; // чтобы видеть back faces
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0]    = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.RTVFormats[1]    = DXGI_FORMAT_UNKNOWN;
+        pd.RTVFormats[2]    = DXGI_FORMAT_UNKNOWN;
+        ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pd,
+            IID_PPV_ARGS(&m_geometryWirePSO)), "Create Wireframe PSO");
     }
 
+    // ── Lighting PSO (без изменений) ──────────────────────────────────────
     {
         D3D12_BLEND_DESC blend{};
         blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;

@@ -3,11 +3,9 @@
 #include <sstream>
 #include <unordered_map>
 #include <cmath>
-#include <windows.h>    // WideCharToMultiByte / MultiByteToWideChar
+#include <windows.h>
 using namespace DirectX;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Утилиты для строк
 // ─────────────────────────────────────────────────────────────────────────────
 static std::wstring StrToWStr(const std::string& s)
 {
@@ -24,10 +22,6 @@ static std::wstring GetDirectory(const std::wstring& path)
     return (pos == std::wstring::npos) ? L"" : path.substr(0, pos + 1);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Разбор одного токена грани: "1"  "1/2"  "1/2/3"  "1//3"
-// Возвращает 1-based индексы (pos, uv, normal).  Отрицательные индексы OBJ
-// (относительные) корректно преобразуются в абсолютные.
 // ─────────────────────────────────────────────────────────────────────────────
 struct FaceIdx { int p = 0, t = 0, n = 0; };
 
@@ -50,19 +44,16 @@ static FaceIdx ParseFaceToken(const std::string& tok,
         }
         else
         {
-            if (b > a + 1)       fi.t = std::stoi(tok.substr(a + 1, b - a - 1));
+            if (b > a + 1)          fi.t = std::stoi(tok.substr(a + 1, b - a - 1));
             if (b + 1 < tok.size()) fi.n = std::stoi(tok.substr(b + 1));
         }
     }
-    // Отрицательные индексы OBJ: -1 = последний элемент
     if (fi.p < 0) fi.p += posCount + 1;
     if (fi.t < 0) fi.t += uvCount  + 1;
     if (fi.n < 0) fi.n += normCount + 1;
     return fi;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Загрузка .mtl
 // ─────────────────────────────────────────────────────────────────────────────
 static void LoadMtl(const std::wstring& mtlPath, const std::wstring& dir,
                     std::vector<ObjMaterial>& mats)
@@ -94,20 +85,123 @@ static void LoadMtl(const std::wstring& mtlPath, const std::wstring& dir,
             else if (tok == "Kd") { ss >> cur->Kd.x >> cur->Kd.y >> cur->Kd.z; }
             else if (tok == "Ks") { ss >> cur->Ks.x >> cur->Ks.y >> cur->Ks.z; }
             else if (tok == "Ns") { ss >> cur->Ns; }
-            else if (tok == "map_Kd")
+            else if (tok == "map_Kd" || tok == "map_kd")
             {
-                // Собираем остаток строки (путь может содержать пробелы)
                 std::string rest;
                 std::getline(ss >> std::ws, rest);
                 if (!rest.empty() && rest.back() == '\r') rest.pop_back();
                 cur->map_Kd = dir + StrToWStr(rest);
+            }
+            // Normal map — разные конвенции в .mtl файлах
+            else if (tok == "map_Bump" || tok == "map_bump" ||
+                     tok == "bump"     || tok == "map_Kn"   || tok == "norm")
+            {
+                std::string rest;
+                std::getline(ss >> std::ws, rest);
+                if (!rest.empty() && rest.back() == '\r') rest.pop_back();
+                // Пропустить флаги типа "-bm 1.0"
+                if (!rest.empty() && rest[0] == '-')
+                {
+                    // Найти последний токен — он и есть имя файла
+                    std::istringstream ss2(rest);
+                    std::string last, tmp;
+                    while (ss2 >> tmp) last = tmp;
+                    cur->map_Bump = dir + StrToWStr(last);
+                }
+                else
+                    cur->map_Bump = dir + StrToWStr(rest);
+            }
+            // Displacement map
+            else if (tok == "disp" || tok == "map_disp" || tok == "map_Disp")
+            {
+                std::string rest;
+                std::getline(ss >> std::ws, rest);
+                if (!rest.empty() && rest.back() == '\r') rest.pop_back();
+                cur->map_Disp = dir + StrToWStr(rest);
             }
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Главная функция загрузки .obj
+// Вычисляем tangent-векторы по методу MikkTSpace-lite:
+// Для каждого треугольника находим dP/dU, нормализуем и накапливаем.
+// После — нормализуем среднее по всем треугольникам смежным с вершиной
+// и ортогонализируем Gram–Schmidt-ом относительно нормали.
+// ─────────────────────────────────────────────────────────────────────────────
+static void ComputeTangents(ObjModel& model)
+{
+    const size_t nv = model.vertices.size();
+    std::vector<XMFLOAT3> tanAccum(nv, {0,0,0});
+
+    for (size_t i = 0; i + 2 < model.indices.size(); i += 3)
+    {
+        uint32_t i0 = model.indices[i];
+        uint32_t i1 = model.indices[i + 1];
+        uint32_t i2 = model.indices[i + 2];
+
+        const auto& v0 = model.vertices[i0];
+        const auto& v1 = model.vertices[i1];
+        const auto& v2 = model.vertices[i2];
+
+        XMVECTOR p0 = XMLoadFloat3(&v0.Pos);
+        XMVECTOR p1 = XMLoadFloat3(&v1.Pos);
+        XMVECTOR p2 = XMLoadFloat3(&v2.Pos);
+
+        float du1 = v1.TexCoord.x - v0.TexCoord.x;
+        float dv1 = v1.TexCoord.y - v0.TexCoord.y;
+        float du2 = v2.TexCoord.x - v0.TexCoord.x;
+        float dv2 = v2.TexCoord.y - v0.TexCoord.y;
+
+        float det = du1 * dv2 - du2 * dv1;
+        if (fabsf(det) < 1e-8f) continue;
+        float invDet = 1.f / det;
+
+        XMVECTOR edge1 = XMVectorSubtract(p1, p0);
+        XMVECTOR edge2 = XMVectorSubtract(p2, p0);
+
+        // T = invDet * (dv2*edge1 - dv1*edge2)
+        XMVECTOR T = XMVectorScale(
+            XMVectorSubtract(XMVectorScale(edge1, dv2), XMVectorScale(edge2, dv1)),
+            invDet);
+
+        XMFLOAT3 tf; XMStoreFloat3(&tf, T);
+
+        // Накапливаем в каждую из трёх вершин треугольника
+        for (uint32_t idx : {i0, i1, i2})
+        {
+            tanAccum[idx].x += tf.x;
+            tanAccum[idx].y += tf.y;
+            tanAccum[idx].z += tf.z;
+        }
+    }
+
+    // Gram–Schmidt ортогонализация и нормализация
+    for (size_t i = 0; i < nv; ++i)
+    {
+        auto& vert = model.vertices[i];
+        XMVECTOR N = XMLoadFloat3(&vert.Normal);
+        XMVECTOR T = XMLoadFloat3(&tanAccum[i]);
+
+        // Если tangent нулевой (нет UV или плохая геометрия) — заглушка
+        float tlen = XMVectorGetX(XMVector3Length(T));
+        if (tlen < 1e-6f)
+        {
+            // Произвольный ненулевой вектор, перпендикулярный нормали
+            XMVECTOR up = XMVectorSet(0, 1, 0, 0);
+            T = XMVector3Cross(N, up);
+            if (XMVectorGetX(XMVector3Length(T)) < 1e-6f)
+                T = XMVector3Cross(N, XMVectorSet(1, 0, 0, 0));
+        }
+
+        // T_ortho = normalize(T - dot(T,N)*N)
+        T = XMVector3Normalize(
+            XMVectorSubtract(T, XMVectorScale(N, XMVectorGetX(XMVector3Dot(T, N)))));
+
+        XMStoreFloat3(&vert.Tangent, T);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 bool LoadObj(const wchar_t* path, ObjModel& out)
 {
@@ -121,11 +215,10 @@ bool LoadObj(const wchar_t* path, ObjModel& out)
     std::vector<XMFLOAT3> normals;
     std::vector<XMFLOAT2> uvs;
 
-    // Сырые грани сгруппированы по материалу
     struct RawFace  { FaceIdx v[3]; };
     struct RawGroup { int matIndex; std::vector<RawFace> faces; };
     std::vector<RawGroup> groups;
-    int curMat = -1;    // -1 → ещё не установлен
+    int curMat = -1;
 
     std::string line;
     while (std::getline(f, line))
@@ -150,7 +243,7 @@ bool LoadObj(const wchar_t* path, ObjModel& out)
         else if (tok == "vt")
         {
             XMFLOAT2 uv; ss >> uv.x >> uv.y;
-            uv.y = 1.0f - uv.y;    // OBJ — OpenGL-конвенция (Y вверх), D3D — Y вниз
+            uv.y = 1.0f - uv.y;
             uvs.push_back(uv);
         }
         else if (tok == "mtllib")
@@ -162,12 +255,10 @@ bool LoadObj(const wchar_t* path, ObjModel& out)
         {
             std::string matName; ss >> matName;
 
-            // Найти материал по имени
             int mi = -1;
             for (int i = 0; i < (int)out.materials.size(); ++i)
                 if (out.materials[i].name == matName) { mi = i; break; }
 
-            // Если не нашли — создать заглушку
             if (mi < 0)
             {
                 ObjMaterial def; def.name = matName;
@@ -179,7 +270,6 @@ bool LoadObj(const wchar_t* path, ObjModel& out)
         }
         else if (tok == "f")
         {
-            // Убедимся что есть хотя бы одна группа
             if (groups.empty())
             {
                 if (out.materials.empty())
@@ -187,25 +277,21 @@ bool LoadObj(const wchar_t* path, ObjModel& out)
                 groups.push_back({ (curMat >= 0 ? curMat : 0), {} });
             }
 
-            // Читаем произвольное число вершин грани (треугольники, квады и т.д.)
             std::vector<FaceIdx> fv;
             std::string vtok;
             while (ss >> vtok)
                 fv.push_back(ParseFaceToken(vtok,
                     (int)positions.size(), (int)uvs.size(), (int)normals.size()));
 
-            // Fan-триангуляция: (0,i,i+1) для i=1..n-2
             for (int i = 1; i + 1 < (int)fv.size(); ++i)
                 groups.back().faces.push_back({ fv[0], fv[i], fv[i + 1] });
         }
-        // Прочие команды (o, g, s, l, …) — игнорируем
     }
 
-    // Если вообще не было материалов
     if (out.materials.empty())
         out.materials.push_back({ "__default__" });
 
-    // ── Собираем плоские буферы вершин/индексов, дедуплицируя вершины ────
+    // ── Дедупликация вершин ───────────────────────────────────────────────
     struct VKey
     {
         int p, t, n;
@@ -233,6 +319,7 @@ bool LoadObj(const wchar_t* path, ObjModel& out)
         if (fi.p >= 1 && fi.p <= (int)positions.size()) ov.Pos      = positions[fi.p - 1];
         if (fi.t >= 1 && fi.t <= (int)uvs.size())       ov.TexCoord = uvs[fi.t - 1];
         if (fi.n >= 1 && fi.n <= (int)normals.size())   ov.Normal   = normals[fi.n - 1];
+        // Tangent вычисляется отдельно в ComputeTangents()
 
         uint32_t idx = (uint32_t)out.vertices.size();
         out.vertices.push_back(ov);
@@ -256,8 +343,6 @@ bool LoadObj(const wchar_t* path, ObjModel& out)
         }
         sub.indexCount = (uint32_t)out.indices.size() - sub.indexStart;
 
-        // Слить с предыдущим сабмешем если тот же материал (группы с одним mat
-        // встречаются в OBJ при разбивке на объекты)
         if (!out.subMeshes.empty() &&
             out.subMeshes.back().materialIndex == grp.matIndex)
             out.subMeshes.back().indexCount += sub.indexCount;
@@ -265,7 +350,7 @@ bool LoadObj(const wchar_t* path, ObjModel& out)
             out.subMeshes.push_back(sub);
     }
 
-    // ── Генерируем флэт-нормали для вершин у которых нормали отсутствуют ─
+    // ── Flat normals для вершин без нормалей ─────────────────────────────
     auto isZero = [](const XMFLOAT3& v) {
         return fabsf(v.x) < 1e-6f && fabsf(v.y) < 1e-6f && fabsf(v.z) < 1e-6f;
     };
@@ -287,6 +372,9 @@ bool LoadObj(const wchar_t* path, ObjModel& out)
             if (isZero(v2.Normal)) v2.Normal = nf;
         }
     }
+
+    // ── Вычисляем tangent-векторы ─────────────────────────────────────────
+    ComputeTangents(out);
 
     return !out.vertices.empty();
 }

@@ -38,10 +38,20 @@ private:
     POINT m_savedCursorPos     { 0, 0 };
     bool  m_justEnteredRmbLook = false;
 
-    // ── НОВОЕ: edge-trigger для F1/F2 ────────────────────────────────────
-    bool  m_prevF1 = false;
-    bool  m_prevF2 = false;
+    // Edge-trigger флаги для всех хоткеев
+    bool  m_prevF1 = false;   // frustum culling
+    bool  m_prevF2 = false;   // octree culling
+    bool  m_prevF3 = false;   // tessellation toggle
+    bool  m_prevF4 = false;   // normal map toggle
+    bool  m_prevF5 = false;   // wireframe toggle (для отладки)
 
-    // ── НОВОЕ: таймер обновления заголовка ────────────────────────────────
+    // Клавиши изменения параметров тесселяции
+    bool  m_prevPlus  = false; // увеличить tess factor
+    bool  m_prevMinus = false; // уменьшить tess factor
+    bool  m_prevRBrk  = false; // ] увеличить displacement scale
+    bool  m_prevLBrk  = false; // [ уменьшить displacement scale
+
+    bool  m_wireframe = false;
+
     float m_titleTimer = 0.f;
 };

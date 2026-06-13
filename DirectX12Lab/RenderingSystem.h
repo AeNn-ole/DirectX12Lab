@@ -1,5 +1,4 @@
 #pragma once
-// NOMINMAX до любого windows.h — иначе макросы min/max сломают std::
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -24,11 +23,27 @@ public:
     void Draw();
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
 
+    // ── Culling toggles (сохраняем) ───────────────────────────────────────
     void ToggleFrustumCulling()  { m_frustumCullingEnabled = !m_frustumCullingEnabled; }
     void ToggleOctreeCulling()   { m_octreeCullingEnabled  = !m_octreeCullingEnabled;  }
     bool IsFrustumCullingOn()    const { return m_frustumCullingEnabled; }
     bool IsOctreeCullingOn()     const { return m_octreeCullingEnabled;  }
     int  GetVisibleCount()       const { return m_lastVisibleCount; }
+
+    // ── Тесселяция ────────────────────────────────────────────────────────
+    void  SetTessFactor(float nearF, float farF)
+    { m_tessFactorNear = nearF; m_tessFactorFar = farF; }
+    void  SetTessDistances(float dNear, float dFar)
+    { m_tessDistNear = dNear; m_tessDistFar = dFar; }
+    void  SetDisplacementScale(float s) { m_displacementScale = s; }
+    void  ToggleNormalMapping()  { m_normalMappingEnabled  = !m_normalMappingEnabled; }
+    void  ToggleTessellation()   { m_tessellationEnabled   = !m_tessellationEnabled;  }
+    void  ToggleWireframe()      { m_wireframe = !m_wireframe; }
+    bool  IsTessellationOn()     const { return m_tessellationEnabled; }
+    bool  IsNormalMappingOn()    const { return m_normalMappingEnabled; }
+    bool  IsWireframeOn()        const { return m_wireframe; }
+    float GetTessFactorNear()    const { return m_tessFactorNear; }
+    float GetDisplacementScale() const { return m_displacementScale; }
 
 private:
     bool CreateDevice();
@@ -65,11 +80,25 @@ private:
     ID3D12Resource*              CurrentBackBuffer()    const;
     void RecreateDepthSRV();
 
+    // Пересоздать PSO при смене режима тесселяции
+    void RebuildGeometryPSO();
+
 private:
-    // ── Константы — объявляем ПЕРВЫМИ чтобы массивы ниже их видели ───────
+    // ── Константы ─────────────────────────────────────────────────────────
     static constexpr uint32_t kSwapChainBufferCount = 2;
-    static constexpr int      kMaxInstances         = 2500;
+    static constexpr int      kMaxInstances         = 1;
     static constexpr int      kMaxLights            = 16;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Раскладка дескрипторной кучи CBV/SRV (shader-visible):
+    //
+    //   [0  .. N-1 ]      CBV → PerMaterialCB слот i         (geom param[1])
+    //   [N  .. 2N-1]      SRV → albedo-текстура материала i  (geom param[2])
+    //   [2N .. 3N-1]      SRV → normal map материала i       (geom param[3])
+    //   [3N .. 4N-1]      SRV → displacement map материала i (geom/DS param[4])
+    //   [4N .. 4N+2]      SRV → G-Buffer (albedo, norm, spec) (light param[0])
+    //   [4N+3]            SRV → глубина                        (light param[0]+3)
+    // ─────────────────────────────────────────────────────────────────────
 
     // ── Вложенные структуры ───────────────────────────────────────────────
     struct InstanceData
@@ -83,8 +112,8 @@ private:
     {
         DirectX::XMFLOAT4X4 World;
         DirectX::XMFLOAT4X4 WorldViewProj;
-        DirectX::XMFLOAT3 EyePosW;   float _pad0 = 0.f;
-        DirectX::XMFLOAT3 LightDirW; float _pad1 = 0.f;
+        DirectX::XMFLOAT3   EyePosW;   float _pad0 = 0.f;
+        DirectX::XMFLOAT3   LightDirW; float _pad1 = 0.f;
     };
 
     struct alignas(16) PerMaterialCB
@@ -93,9 +122,20 @@ private:
         DirectX::XMFLOAT4 Diffuse;
         DirectX::XMFLOAT4 Specular;
         float SpecPower = 32.f; float _pad2[3] = {};
+
         float gTime;            float _padTime[3] = {};
         DirectX::XMFLOAT2 UVOffset{ 0.f, 0.f };
         DirectX::XMFLOAT2 UVTiling{ 1.f, 1.f };
+
+        // ── Параметры тесселяции / displacement ──────────────────────────
+        float TessFactorNear  = 8.f;   // макс. фактор тесселяции (рядом)
+        float TessFactorFar   = 1.f;   // мин. фактор (далеко)
+        float TessDistNear    = 10.f;  // дистанция «рядом»
+        float TessDistFar     = 200.f; // дистанция «далеко»
+
+        float DisplacementScale = 5.f; // амплитуда смещения по дисплейсменту
+        int   EnableNormalMap   = 1;   // 1 = использовать normal map
+        float _padTess[2]       = {};
     };
 
     struct alignas(16) Light
@@ -117,7 +157,12 @@ private:
         Light               Lights[kMaxLights];
     };
 
-    struct GpuMaterial { Microsoft::WRL::ComPtr<ID3D12Resource> texture; };
+    struct GpuMaterial
+    {
+        Microsoft::WRL::ComPtr<ID3D12Resource> texture;
+        Microsoft::WRL::ComPtr<ID3D12Resource> normalMap;
+        Microsoft::WRL::ComPtr<ID3D12Resource> dispMap;
+    };
 
     // ── Состояние ─────────────────────────────────────────────────────────
     bool     m_initialized  = false;
@@ -158,10 +203,12 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightingPSO;
 
-    Microsoft::WRL::ComPtr<ID3DBlob> m_gbVS, m_gbPS;
+    // Шейдеры geometry pass (VS/HS/DS/PS)
+    Microsoft::WRL::ComPtr<ID3DBlob> m_gbVS, m_gbHS, m_gbDS, m_gbPS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_lightVS, m_lightPS;
 
-    D3D12_INPUT_ELEMENT_DESC m_inputLayout[3]{};
+    // 4 компонента: POSITION, NORMAL, TANGENT, TEXCOORD
+    D3D12_INPUT_ELEMENT_DESC m_inputLayout[4]{};
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_vertexBufferGPU;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_indexBufferGPU;
@@ -187,6 +234,7 @@ private:
     DirectX::XMFLOAT3         m_modelCenter{ 0.f, 0.f, 0.f };
     float                     m_modelRadius = 1.f;
 
+    // ── Culling ───────────────────────────────────────────────────────────
     bool             m_frustumCullingEnabled = false;
     bool             m_octreeCullingEnabled  = false;
     FrustumPlanes    m_frustumPlanes{};
@@ -194,6 +242,7 @@ private:
     std::vector<int> m_visibleIndices;
     int              m_lastVisibleCount = 0;
 
+    // ── Камера / свет ─────────────────────────────────────────────────────
     DirectX::XMFLOAT4X4 m_view{};
     DirectX::XMFLOAT4X4 m_proj{};
     DirectX::XMFLOAT3   m_eyePos{ 0.5f, 4.f, -5.f };
@@ -202,4 +251,17 @@ private:
     float m_totalTime = 0.f;
     Light m_lights[kMaxLights]{};
     int   m_numLights = 0;
+
+    // ── Параметры тесселяции (CPU-сторона) ───────────────────────────────
+    bool  m_tessellationEnabled  = true;
+    bool  m_normalMappingEnabled = true;
+    bool  m_wireframe            = false;
+    float m_tessFactorNear       = 8.f;
+    float m_tessFactorFar        = 1.f;
+    float m_tessDistNear         = 10.f;
+    float m_tessDistFar          = 200.f;
+    float m_displacementScale    = 5.f;
+
+    // Wireframe PSO для визуальной проверки тесселяции (Z)
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryWirePSO;
 };

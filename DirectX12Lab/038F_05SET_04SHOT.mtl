@@ -1,0 +1,8 @@
+newmtl default
+Ka 1 1 1
+Kd 1 1 1
+Ks 0.2 0.2 0.2
+Ns 32
+map_Kd textures/038F_05SET_04SHOT_DIFFUSE.png
+map_bump textures/038F_05SET_04SHOT_NORMAL.png
+disp textures/038F_05SET_04SHOT_DISPLACEMENT.png
