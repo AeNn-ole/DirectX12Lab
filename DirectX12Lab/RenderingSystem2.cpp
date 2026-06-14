@@ -271,6 +271,7 @@ void RenderingSystem::GeometryPass()
 // ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::LightingPass()
 {
+    // Depth → SRV
     D3D12_RESOURCE_BARRIER depthToSRV{};
     depthToSRV.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     depthToSRV.Transition = {
@@ -279,12 +280,22 @@ void RenderingSystem::LightingPass()
         D3D12_RESOURCE_STATE_DEPTH_WRITE,
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
     };
-    m_cmdList->ResourceBarrier(1, &depthToSRV);
+    // HDR RT: PSR → RT
+    D3D12_RESOURCE_BARRIER hdrToRT{};
+    hdrToRT.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    hdrToRT.Transition = {
+        m_hdrRT.Get(),
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_RENDER_TARGET
+    };
+    D3D12_RESOURCE_BARRIER bars2[2] = { depthToSRV, hdrToRT };
+    m_cmdList->ResourceBarrier(2, bars2);
 
-    auto rtv = CurrentBackBufferRTV();
-    m_cmdList->OMSetRenderTargets(1, &rtv, TRUE, nullptr);
+    // Рисуем в HDR RT (не в back buffer)
+    m_cmdList->OMSetRenderTargets(1, &m_hdrRtv, TRUE, nullptr);
     const float clearColor[4] = { 0.f, 0.f, 0.f, 1.f };
-    m_cmdList->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
+    m_cmdList->ClearRenderTargetView(m_hdrRtv, clearColor, 0, nullptr);
 
     m_cmdList->SetPipelineState(m_lightingPSO.Get());
     m_cmdList->SetGraphicsRootSignature(m_lightingRootSig.Get());
@@ -298,10 +309,72 @@ void RenderingSystem::LightingPass()
     m_cmdList->SetGraphicsRootConstantBufferView(1, m_lightingCB->GetGPUVirtualAddress());
     m_cmdList->DrawInstanced(3, 1, 0, 0);
 
-    D3D12_RESOURCE_BARRIER depthBack = depthToSRV;
-    depthBack.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    depthBack.Transition.StateAfter  = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    m_cmdList->ResourceBarrier(1, &depthBack);
+    // Depth → DSV, HDR RT → PSR (для чтения в PostFxPass)
+    D3D12_RESOURCE_BARRIER depthBack{};
+    depthBack.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    depthBack.Transition = {
+        m_depthStencilBuffer.Get(),
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE
+    };
+    D3D12_RESOURCE_BARRIER hdrBack{};
+    hdrBack.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    hdrBack.Transition = {
+        m_hdrRT.Get(),
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+    };
+    D3D12_RESOURCE_BARRIER barsEnd[2] = { depthBack, hdrBack };
+    m_cmdList->ResourceBarrier(2, barsEnd);
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PostFxPass — читает HDR RT, пишет в back buffer с пост-эффектами
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderingSystem::PostFxPass()
+{
+    // Обновляем CB
+    static LARGE_INTEGER freq2{}, t02{};
+    if (!freq2.QuadPart) {
+        QueryPerformanceFrequency(&freq2);
+        QueryPerformanceCounter(&t02);
+    }
+    LARGE_INTEGER now2; QueryPerformanceCounter(&now2);
+    float t = (float)((now2.QuadPart - t02.QuadPart) / (double)freq2.QuadPart);
+
+    PostFxConstants pfc{};
+    pfc.gTime        = t;
+    pfc.gMode        = m_postFxMode;
+    pfc.gFishStrength = m_fishStrength;
+    pfc.gVhsStrength  = m_vhsStrength;
+    std::memcpy(m_mappedPostFxCB, &pfc, sizeof(pfc));
+
+    // Back buffer RT
+    auto rtv = CurrentBackBufferRTV();
+    m_cmdList->OMSetRenderTargets(1, &rtv, TRUE, nullptr);
+    const float black[4] = {0.f,0.f,0.f,1.f};
+    m_cmdList->ClearRenderTargetView(rtv, black, 0, nullptr);
+
+    m_cmdList->SetPipelineState(m_postFxPSO.Get());
+    m_cmdList->SetGraphicsRootSignature(m_postFxRootSig.Get());
+    m_cmdList->RSSetViewports(1, &m_viewport);
+    m_cmdList->RSSetScissorRects(1, &m_scissorRect);
+    m_cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    ID3D12DescriptorHeap* heaps[] = { m_cbvSrvHeap.Get() };
+    m_cmdList->SetDescriptorHeaps(1, heaps);
+
+    // HDR RT SRV в слоте [4N+4]
+    D3D12_GPU_DESCRIPTOR_HANDLE srvH =
+        m_cbvSrvHeap->GetGPUDescriptorHandleForHeapStart();
+    srvH.ptr += (SIZE_T)((4 * m_numMaterials + 4) * m_cbvSrvDescriptorSize);
+    m_cmdList->SetGraphicsRootDescriptorTable(0, srvH);
+    m_cmdList->SetGraphicsRootConstantBufferView(1, m_postFxCB->GetGPUVirtualAddress());
+
+    m_cmdList->DrawInstanced(3, 1, 0, 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -324,7 +397,10 @@ void RenderingSystem::Draw()
     m_cmdList->ResourceBarrier(1, &toRT);
 
     GeometryPass();
-    if (!m_wireframe) LightingPass();
+    if (!m_wireframe) {
+        LightingPass();
+        PostFxPass();
+    }
 
     D3D12_RESOURCE_BARRIER toPresent = toRT;
     toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -371,6 +447,7 @@ void RenderingSystem::OnResize(uint32_t width, uint32_t height)
         m_rtvHeap.Get(), kSwapChainBufferCount, m_rtvDescriptorSize,
         m_cbvSrvHeap.Get(), 4 * m_numMaterials, m_cbvSrvDescriptorSize);
     RecreateDepthSRV();
+    CreateHdrRT();
 
     m_viewport    = { 0, 0, (float)width, (float)height, 0, 1 };
     m_scissorRect = { 0, 0, (LONG)width,  (LONG)height };

@@ -39,6 +39,9 @@ public:
     void  ToggleNormalMapping()  { m_normalMappingEnabled  = !m_normalMappingEnabled; }
     void  ToggleTessellation()   { m_tessellationEnabled   = !m_tessellationEnabled;  }
     void  ToggleWireframe()      { m_wireframe = !m_wireframe; }
+    void  SetPostFxMode(int m)   { m_postFxMode = m; }
+    int   GetPostFxMode()        const { return m_postFxMode; }
+    void  CyclePostFx()          { m_postFxMode = (m_postFxMode + 1) % 4; }
     bool  IsTessellationOn()     const { return m_tessellationEnabled; }
     bool  IsNormalMappingOn()    const { return m_normalMappingEnabled; }
     bool  IsWireframeOn()        const { return m_wireframe; }
@@ -82,6 +85,9 @@ private:
 
     // Пересоздать PSO при смене режима тесселяции
     void RebuildGeometryPSO();
+    bool CreateHdrRT();
+    bool BuildPostFxPSO();
+    void PostFxPass();
 
 private:
     // ── Константы ─────────────────────────────────────────────────────────
@@ -264,4 +270,30 @@ private:
 
     // Wireframe PSO для визуальной проверки тесселяции (Z)
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryWirePSO;
+
+    // ── Post-process ──────────────────────────────────────────────────────
+    // HDR RT — промежуточный таргет: lighting пишет сюда, post-fx читает
+    Microsoft::WRL::ComPtr<ID3D12Resource>      m_hdrRT;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_hdrRtvHeap; // отдельная куча RTV
+    // SRV для hdrRT лежит в m_cbvSrvHeap в слоте [4N+4]
+    D3D12_CPU_DESCRIPTOR_HANDLE m_hdrRtv{};
+
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_postFxRootSig;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_postFxPSO;
+    Microsoft::WRL::ComPtr<ID3DBlob>            m_postVS, m_postPS;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_postFxCB;
+    uint8_t* m_mappedPostFxCB = nullptr;
+
+    int   m_postFxMode    = 0;     // 0=off 1=fisheye 2=VHS 3=both
+    float m_fishStrength  = 0.5f;
+    float m_vhsStrength   = 1.0f;
+
+    struct alignas(16) PostFxConstants
+    {
+        float gTime;
+        int   gMode;
+        float gFishStrength;
+        float gVhsStrength;
+    };
 };

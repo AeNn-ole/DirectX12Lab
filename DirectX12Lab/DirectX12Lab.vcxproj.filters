@@ -69,5 +69,6 @@
   <ItemGroup>
     <None Include="GBuffer.hlsl" />
     <None Include="Lighting.hlsl" />
+    <None Include="PostFx.hlsl" />
   </ItemGroup>
 </Project>

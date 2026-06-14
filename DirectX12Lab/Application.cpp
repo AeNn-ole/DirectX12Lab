@@ -86,6 +86,7 @@ void App::Update(float dt)
     const bool f2    = m_input->IsKeyDown(VK_F2);
     const bool f3    = m_input->IsKeyDown(VK_F3);
     const bool f5    = m_input->IsKeyDown('Z');
+    const bool f6    = m_input->IsKeyDown(VK_F5);
     const bool f4    = m_input->IsKeyDown(VK_F4);
     const bool plus  = m_input->IsKeyDown(VK_OEM_PLUS)  || m_input->IsKeyDown(VK_ADD);
     const bool minus = m_input->IsKeyDown(VK_OEM_MINUS) || m_input->IsKeyDown(VK_SUBTRACT);
@@ -116,9 +117,13 @@ void App::Update(float dt)
     if (f4 && !m_prevF4)
         m_renderer->ToggleNormalMapping();
 
-    // ── Z: wireframe toggle (для проверки тесселяции) ────────────────────
+    // ── Z: wireframe toggle ─────────────────────────────────────────────
     if (f5 && !m_prevF5)
         m_renderer->ToggleWireframe();
+
+    // ── F5: cycle post-effects (off → fisheye → VHS → both) ──────────────
+    if (f6 && !m_prevF6)
+        m_renderer->CyclePostFx();
 
     // ── +/- : tessellation factor (near) ──────────────────────────────────
     if (plus && !m_prevPlus)
@@ -145,6 +150,7 @@ void App::Update(float dt)
     m_prevF3    = f3;
     m_prevF4    = f4;
     m_prevF5    = f5;
+    m_prevF6    = f6;
     m_prevPlus  = plus;
     m_prevMinus = minus;
     m_prevRBrk  = rbrk;
@@ -165,14 +171,22 @@ void App::Update(float dt)
         swprintf_s(title,
             L"DX12 Deferred  |  Vis:%d  |  Cull:%hs  |"
             L"  Tess:%hs(%.0f)  |  Disp:%.1f  |  NM:%hs  |  Wire:%hs"
-            L"  |  F1=Frustum F2=Oct F3=Tess F4=NM Z=Wire +/-=Factor []= Disp",
+            L"  |  F1=Frustum F2=Oct F3=Tess F4=NM F5=FX Z=Wire +/-=Factor []= Disp",
             m_renderer->GetVisibleCount(),
             cullMode,
             m_renderer->IsTessellationOn() ? "ON " : "OFF",
             m_renderer->GetTessFactorNear(),
             m_renderer->GetDisplacementScale(),
             m_renderer->IsNormalMappingOn() ? "ON" : "OFF",
-            m_renderer->IsWireframeOn()    ? "ON" : "OFF");
+            m_renderer->IsWireframeOn()    ? "ON" : "OFF",
+            [&]() -> const char* {
+                switch(m_renderer->GetPostFxMode()) {
+                    case 1: return "FishEye";
+                    case 2: return "VHS";
+                    case 3: return "Both";
+                    default: return "Off";
+                }
+            }());
 
         SetWindowTextW(m_window->GetHwnd(), title);
     }

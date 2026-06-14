@@ -43,7 +43,8 @@ private:
     bool  m_prevF2 = false;   // octree culling
     bool  m_prevF3 = false;   // tessellation toggle
     bool  m_prevF4 = false;   // normal map toggle
-    bool  m_prevF5 = false;   // wireframe toggle (для отладки)
+    bool  m_prevF5 = false;   // wireframe toggle
+    bool  m_prevF6 = false;   // post-fx cycle (для отладки)
 
     // Клавиши изменения параметров тесселяции
     bool  m_prevPlus  = false; // увеличить tess factor

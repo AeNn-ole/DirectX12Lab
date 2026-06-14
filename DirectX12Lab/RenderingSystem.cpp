@@ -107,6 +107,8 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     BuildDescriptorViews();
     BuildRootSignatures();
     BuildPSOs();
+    CreateHdrRT();
+    BuildPostFxPSO();
     InitLights();
 
     m_initialized = true;
@@ -456,7 +458,7 @@ bool RenderingSystem::BuildDescriptorViews()
 
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
-        hd.NumDescriptors = 4 * N + 4;   // N CBV + N albedo + N normal + N disp + 3 GBuf + 1 depth
+        hd.NumDescriptors = 4 * N + 5;   // N CBV + N albedo + N normal + N disp + 3 GBuf + 1 depth + 1 HDR RT
         hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ThrowIfFailed(m_device->CreateDescriptorHeap(&hd,
@@ -740,5 +742,173 @@ bool RenderingSystem::BuildPSOs()
         ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pd,
             IID_PPV_ARGS(&m_lightingPSO)), "Create Lighting PSO");
     }
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CreateHdrRT — промежуточный HDR render target
+// Формат R16G16B16A16_FLOAT — сохраняет HDR-диапазон после lighting pass
+// SRV кладём в m_cbvSrvHeap слот [4N+4]
+// ─────────────────────────────────────────────────────────────────────────────
+bool RenderingSystem::CreateHdrRT()
+{
+    m_hdrRT.Reset();
+
+    // ── Texture ───────────────────────────────────────────────────────────
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width            = m_width;
+    td.Height           = m_height;
+    td.DepthOrArraySize = 1;
+    td.MipLevels        = 1;
+    td.Format           = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    td.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    D3D12_CLEAR_VALUE cv{};
+    cv.Format   = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    cv.Color[0] = cv.Color[1] = cv.Color[2] = 0.f; cv.Color[3] = 1.f;
+
+    auto hp = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+    ThrowIfFailed(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
+        IID_PPV_ARGS(&m_hdrRT)), "Create HDR RT");
+
+    // ── RTV ───────────────────────────────────────────────────────────────
+    if (!m_hdrRtvHeap)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.NumDescriptors = 1;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        ThrowIfFailed(m_device->CreateDescriptorHeap(&hd,
+            IID_PPV_ARGS(&m_hdrRtvHeap)), "HDR RTV Heap");
+    }
+    m_hdrRtv = m_hdrRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    m_device->CreateRenderTargetView(m_hdrRT.Get(), nullptr, m_hdrRtv);
+
+    // ── SRV в слоте [4N+4] ────────────────────────────────────────────────
+    const uint32_t slot = 4 * m_numMaterials + 4;
+    D3D12_CPU_DESCRIPTOR_HANDLE srvH =
+        m_cbvSrvHeap->GetCPUDescriptorHandleForHeapStart();
+    srvH.ptr += (SIZE_T)(slot * m_cbvSrvDescriptorSize);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvd{};
+    srvd.Format                  = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    srvd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvd.Texture2D.MipLevels     = 1;
+    m_device->CreateShaderResourceView(m_hdrRT.Get(), &srvd, srvH);
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+bool RenderingSystem::BuildPostFxPSO()
+{
+    UINT flags = 0;
+#if defined(_DEBUG)
+    flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+    ComPtr<ID3DBlob> err;
+    auto compile = [&](const wchar_t* file, const char* entry, const char* target,
+                        ComPtr<ID3DBlob>& out)
+    {
+        err.Reset();
+        HRESULT hr = D3DCompileFromFile(file, nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            entry, target, flags, 0, &out, &err);
+        if (FAILED(hr)) {
+            if (err) throw std::runtime_error((char*)err->GetBufferPointer());
+            ThrowIfFailed(hr, entry);
+        }
+    };
+    compile(L"PostFx.hlsl", "VSMain_Post", "vs_5_0", m_postVS);
+    compile(L"PostFx.hlsl", "PSMain_Post", "ps_5_0", m_postPS);
+
+    // ── Root Signature ────────────────────────────────────────────────────
+    {
+        D3D12_DESCRIPTOR_RANGE srvRange{};
+        srvRange = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,
+                     D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+
+        D3D12_ROOT_PARAMETER params[2]{};
+        // param[0]: SRV table → t0 (HDR RT)
+        params[0].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[0].DescriptorTable  = { 1, &srvRange };
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        // param[1]: inline CBV → b0 (PostFxConstants)
+        params[1].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[1].Descriptor.ShaderRegister = 0;
+        params[1].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_STATIC_SAMPLER_DESC samp{};
+        samp.Filter         = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp.MaxAnisotropy  = 1;
+        samp.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samp.MaxLOD         = D3D12_FLOAT32_MAX;
+        samp.ShaderRegister = 0;
+        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters     = 2; rsd.pParameters = params;
+        rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &samp;
+        rsd.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+        ComPtr<ID3DBlob> ser, rserr;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
+            &ser, &rserr);
+        if (FAILED(hr)) {
+            if (rserr) throw std::runtime_error((char*)rserr->GetBufferPointer());
+            ThrowIfFailed(hr, "SerializeRS PostFx");
+        }
+        ThrowIfFailed(m_device->CreateRootSignature(0, ser->GetBufferPointer(),
+            ser->GetBufferSize(), IID_PPV_ARGS(&m_postFxRootSig)), "CreateRS PostFx");
+    }
+
+    // ── PSO ───────────────────────────────────────────────────────────────
+    {
+        D3D12_BLEND_DESC blend{};
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+        D3D12_RASTERIZER_DESC rast{};
+        rast.FillMode = D3D12_FILL_MODE_SOLID;
+        rast.CullMode = D3D12_CULL_MODE_NONE;
+        rast.DepthClipEnable = TRUE;
+
+        D3D12_DEPTH_STENCIL_DESC ds{};
+        ds.DepthEnable = FALSE; ds.StencilEnable = FALSE;
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature        = m_postFxRootSig.Get();
+        pd.VS                    = { m_postVS->GetBufferPointer(), m_postVS->GetBufferSize() };
+        pd.PS                    = { m_postPS->GetBufferPointer(), m_postPS->GetBufferSize() };
+        pd.BlendState            = blend;
+        pd.RasterizerState       = rast;
+        pd.DepthStencilState     = ds;
+        pd.SampleMask            = UINT_MAX;
+        pd.InputLayout           = { nullptr, 0 };
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets      = 1;
+        pd.RTVFormats[0]         = DXGI_FORMAT_R8G8B8A8_UNORM; // back buffer
+        pd.DSVFormat             = DXGI_FORMAT_UNKNOWN;
+        pd.SampleDesc.Count      = 1;
+
+        ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pd,
+            IID_PPV_ARGS(&m_postFxPSO)), "Create PostFx PSO");
+    }
+
+    // ── Constant Buffer ───────────────────────────────────────────────────
+    {
+        auto up = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        auto bd = BufDesc((UINT64)((sizeof(PostFxConstants) + 255) & ~255));
+        ThrowIfFailed(m_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&m_postFxCB)), "PostFx CB");
+        D3D12_RANGE rr{0,0};
+        ThrowIfFailed(m_postFxCB->Map(0, &rr,
+            reinterpret_cast<void**>(&m_mappedPostFxCB)), "Map PostFx CB");
+    }
+
     return true;
 }
