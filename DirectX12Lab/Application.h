@@ -44,7 +44,8 @@ private:
     bool  m_prevF3 = false;   // tessellation toggle
     bool  m_prevF4 = false;   // normal map toggle
     bool  m_prevF5 = false;   // wireframe toggle
-    bool  m_prevF6 = false;   // post-fx cycle (для отладки)
+    bool  m_prevF6 = false;   // post-fx cycle
+    bool  m_prevF7 = false;   // debug cascades (для отладки)
 
     // Клавиши изменения параметров тесселяции
     bool  m_prevPlus  = false; // увеличить tess factor

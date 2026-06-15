@@ -166,6 +166,18 @@ void RenderingSystem::UpdateLightingCB()
     lc.NumLights  = m_numLights;
     for (int i = 0; i < m_numLights; ++i) lc.Lights[i] = m_lights[i];
 
+    // CSM
+    for (int i = 0; i < kCsmCascades; ++i)
+        lc.LightViewProj[i] = m_cascades[i].LightViewProj;
+    lc.CascadeFarPlanes = {
+        m_cascades[0].FarPlane, m_cascades[1].FarPlane,
+        m_cascades[2].FarPlane, m_cascades[3].FarPlane
+    };
+    lc.NumCascades    = kCsmCascades;
+    lc.DebugCascades  = m_debugCascades ? 1 : 0;
+    lc.ShadowMapSize  = (float)kShadowMapSize;
+    lc.ShadowBias     = 0.005f;
+
     std::memcpy(m_mappedLightingCB, &lc, sizeof(lc));
 }
 
@@ -367,14 +379,209 @@ void RenderingSystem::PostFxPass()
     ID3D12DescriptorHeap* heaps[] = { m_cbvSrvHeap.Get() };
     m_cmdList->SetDescriptorHeaps(1, heaps);
 
-    // HDR RT SRV в слоте [4N+4]
+    // HDR RT SRV в слоте [4N+5]
     D3D12_GPU_DESCRIPTOR_HANDLE srvH =
         m_cbvSrvHeap->GetGPUDescriptorHandleForHeapStart();
-    srvH.ptr += (SIZE_T)((4 * m_numMaterials + 4) * m_cbvSrvDescriptorSize);
+    srvH.ptr += (SIZE_T)((4 * m_numMaterials + 5) * m_cbvSrvDescriptorSize);
     m_cmdList->SetGraphicsRootDescriptorTable(0, srvH);
     m_cmdList->SetGraphicsRootConstantBufferView(1, m_postFxCB->GetGPUVirtualAddress());
 
     m_cmdList->DrawInstanced(3, 1, 0, 0);
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UpdateCsmCascades
+//
+// Нелинейное (Practical Split Scheme) распределение каскадов:
+//   split_i = lerp( log_split, uniform_split, lambda )
+// Для каждого каскада строим tight ortho матрицу вокруг суб-фрустума,
+// ориентированную вдоль направления света.
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderingSystem::UpdateCsmCascades()
+{
+    // Параметры фрустума камеры (берём из m_proj)
+    const float nearZ  = 0.1f;
+    const float farZ   = 5000.f;
+    const float lambda = 0.75f;  // смешение log и uniform
+
+    // Вычисляем дальние плоскости каскадов (Practical Split Scheme)
+    float splits[kCsmCascades + 1];
+    splits[0] = nearZ;
+    for (int i = 1; i <= kCsmCascades; ++i)
+    {
+        float iF  = (float)i / kCsmCascades;
+        float log  = nearZ * powf(farZ / nearZ, iF);
+        float uni  = nearZ + (farZ - nearZ) * iF;
+        splits[i]  = lambda * log + (1.f - lambda) * uni;
+    }
+
+    // Направление света (нормализованное)
+    XMVECTOR lightDir = XMVector3Normalize(XMLoadFloat3(&m_lightDir));
+
+    XMMATRIX view = XMLoadFloat4x4(&m_view);
+    XMMATRIX proj = XMLoadFloat4x4(&m_proj);
+    XMMATRIX invVP; XMVECTOR det;
+
+    for (int c = 0; c < kCsmCascades; ++c)
+    {
+        float zNear = splits[c];
+        float zFar  = splits[c + 1];
+
+        // 8 вершин суб-фрустума в NDC (D3D: z in [0,1])
+        // строим суб-проекцию только для [zNear, zFar]
+        XMMATRIX subProj = XMMatrixPerspectiveFovLH(
+            0.25f * XM_PI,
+            m_width > 0 ? (float)m_width / m_height : 1.f,
+            zNear, zFar);
+        XMMATRIX subVP    = view * subProj;
+        invVP = XMMatrixInverse(&det, subVP);
+
+        // Вершины единичного куба NDC
+        static const XMFLOAT3 ndcCorners[8] = {
+            {-1,-1, 0}, { 1,-1, 0}, {-1, 1, 0}, { 1, 1, 0},
+            {-1,-1, 1}, { 1,-1, 1}, {-1, 1, 1}, { 1, 1, 1},
+        };
+
+        // Трансформируем в world space
+        XMVECTOR worldCorners[8];
+        XMVECTOR center = XMVectorZero();
+        for (int k = 0; k < 8; ++k)
+        {
+            XMVECTOR ndc = XMVectorSet(ndcCorners[k].x, ndcCorners[k].y,
+                                       ndcCorners[k].z, 1.f);
+            XMVECTOR wc  = XMVector4Transform(ndc, invVP);
+            wc = XMVectorDivide(wc, XMVectorSplatW(wc));
+            worldCorners[k] = wc;
+            center = XMVectorAdd(center, wc);
+        }
+        center = XMVectorScale(center, 1.f / 8.f);
+
+        // Light view matrix.
+        // Важно: используем фиксированное начало координат (0,0,0) как target,
+        // а не центр фрустума — иначе при повороте камеры матрица меняется
+        // и тени двигаются. AABB всё равно захватит нужную область через snap.
+        XMVECTOR worldUp = XMVectorSet(0, 1, 0, 0);
+        if (fabsf(XMVectorGetY(lightDir)) > 0.99f)
+            worldUp = XMVectorSet(0, 0, 1, 0);
+        // eye = центр фрустума минус lightDir (смотрим вдоль света)
+        // Используем centre только для позиционирования — направление фиксировано
+        XMVECTOR eye = XMVectorSubtract(center, lightDir);
+        XMMATRIX lightView = XMMatrixLookAtLH(eye, center, worldUp);
+
+        // Проецируем все 8 вершин в light view space → AABB
+        float minX =  FLT_MAX, maxX = -FLT_MAX;
+        float minY =  FLT_MAX, maxY = -FLT_MAX;
+        float minZ =  FLT_MAX, maxZ = -FLT_MAX;
+        for (int k = 0; k < 8; ++k)
+        {
+            XMVECTOR lv = XMVector4Transform(worldCorners[k], lightView);
+            float x = XMVectorGetX(lv), y = XMVectorGetY(lv), z = XMVectorGetZ(lv);
+            minX = (std::min)(minX, x); maxX = (std::max)(maxX, x);
+            minY = (std::min)(minY, y); maxY = (std::max)(maxY, y);
+            minZ = (std::min)(minZ, z); maxZ = (std::max)(maxZ, z);
+        }
+
+        // Расширяем Z назад чтобы захватить объекты за фрустумом (отбрасывают тени)
+        float zMult = 3.f;
+        if (minZ < 0) minZ *= zMult; else minZ /= zMult;
+        if (maxZ < 0) maxZ /= zMult; else maxZ *= zMult;
+
+        // ── Snap to texel grid (стабилизация теней) ──────────────────────
+        // Без этого при повороте камеры AABB плавно смещается в light space
+        // и тени "плывут". Решение: округляем min/max до границ текселей.
+        //
+        // Размер одного тексела в world units (в light space):
+        float worldUnitsPerTexelX = (maxX - minX) / (float)kShadowMapSize;
+        float worldUnitsPerTexelY = (maxY - minY) / (float)kShadowMapSize;
+
+        // Округляем границы AABB вниз до ближайшего тексела
+        minX = floorf(minX / worldUnitsPerTexelX) * worldUnitsPerTexelX;
+        maxX = floorf(maxX / worldUnitsPerTexelX) * worldUnitsPerTexelX;
+        minY = floorf(minY / worldUnitsPerTexelY) * worldUnitsPerTexelY;
+        maxY = floorf(maxY / worldUnitsPerTexelY) * worldUnitsPerTexelY;
+
+        // Ortho projection для стабилизированного AABB
+        XMMATRIX lightProj = XMMatrixOrthographicOffCenterLH(
+            minX, maxX, minY, maxY, minZ, maxZ);
+
+        XMMATRIX lvp = lightView * lightProj;
+        XMStoreFloat4x4(&m_cascades[c].LightViewProj, XMMatrixTranspose(lvp));
+        m_cascades[c].FarPlane = zFar;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ShadowPass — рендерим сцену kCsmCascades раз в shadow map array
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderingSystem::ShadowPass()
+{
+    // Shadow map: PSR → DEPTH_WRITE
+    D3D12_RESOURCE_BARRIER toDepth{};
+    toDepth.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toDepth.Transition = {
+        m_shadowMap.Get(),
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE
+    };
+    m_cmdList->ResourceBarrier(1, &toDepth);
+
+    m_cmdList->SetPipelineState(m_shadowPSO.Get());
+    m_cmdList->SetGraphicsRootSignature(m_shadowRootSig.Get());
+    m_cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_cmdList->IASetVertexBuffers(0, 1, &m_vbv);
+    m_cmdList->IASetIndexBuffer(&m_ibv);
+
+    D3D12_VIEWPORT shadowVP = { 0, 0,
+        (float)kShadowMapSize, (float)kShadowMapSize, 0, 1 };
+    D3D12_RECT shadowScissor = { 0, 0,
+        (LONG)kShadowMapSize, (LONG)kShadowMapSize };
+
+    uint32_t dsvSize = m_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvBase =
+        m_shadowDsvHeap->GetCPUDescriptorHandleForHeapStart();
+
+    // два float4x4 = 128 байт, выравниваем до 256
+    const uint32_t cbStride = 256u;
+
+    for (int c = 0; c < kCsmCascades; ++c)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvBase;
+        dsv.ptr += (SIZE_T)(c * dsvSize);
+
+        m_cmdList->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+        m_cmdList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.f, 0, 0, nullptr);
+        m_cmdList->RSSetViewports(1, &shadowVP);
+        m_cmdList->RSSetScissorRects(1, &shadowScissor);
+
+        for (int i : m_visibleIndices)
+        {
+            // Пишем CB: LightViewProj каскада + World инстанса
+            struct { DirectX::XMFLOAT4X4 LightViewProj; DirectX::XMFLOAT4X4 World; } cbd{};
+            cbd.LightViewProj = m_cascades[c].LightViewProj;
+            cbd.World         = m_instances[i].World;
+            uint32_t slot = (uint32_t)(c * kMaxInstances + i);
+            std::memcpy(m_mappedShadowCB + (size_t)slot * cbStride,
+                        &cbd, sizeof(cbd));
+
+            D3D12_GPU_VIRTUAL_ADDRESS addr =
+                m_shadowCB->GetGPUVirtualAddress() +
+                (D3D12_GPU_VIRTUAL_ADDRESS)slot * cbStride;
+            m_cmdList->SetGraphicsRootConstantBufferView(0, addr);
+
+            for (const auto& sub : m_model.subMeshes)
+                m_cmdList->DrawIndexedInstanced(
+                    sub.indexCount, 1, sub.indexStart, 0, 0);
+        }
+    }
+
+    // Shadow map: DEPTH_WRITE → PSR
+    D3D12_RESOURCE_BARRIER toPSR = toDepth;
+    toPSR.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    toPSR.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_cmdList->ResourceBarrier(1, &toPSR);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -396,6 +603,8 @@ void RenderingSystem::Draw()
     };
     m_cmdList->ResourceBarrier(1, &toRT);
 
+    UpdateCsmCascades();
+    ShadowPass();
     GeometryPass();
     if (!m_wireframe) {
         LightingPass();
@@ -447,6 +656,7 @@ void RenderingSystem::OnResize(uint32_t width, uint32_t height)
         m_rtvHeap.Get(), kSwapChainBufferCount, m_rtvDescriptorSize,
         m_cbvSrvHeap.Get(), 4 * m_numMaterials, m_cbvSrvDescriptorSize);
     RecreateDepthSRV();
+    CreateShadowMap();
     CreateHdrRT();
 
     m_viewport    = { 0, 0, (float)width, (float)height, 0, 1 };

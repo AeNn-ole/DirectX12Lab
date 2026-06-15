@@ -109,6 +109,8 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     BuildPSOs();
     CreateHdrRT();
     BuildPostFxPSO();
+    CreateShadowMap();
+    BuildShadowPSO();
     InitLights();
 
     m_initialized = true;
@@ -458,7 +460,7 @@ bool RenderingSystem::BuildDescriptorViews()
 
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
-        hd.NumDescriptors = 4 * N + 5;   // N CBV + N albedo + N normal + N disp + 3 GBuf + 1 depth + 1 HDR RT
+        hd.NumDescriptors = 4 * N + 6;   // N CBV + N albedo + N normal + N disp + 3 GBuf + 1 depth + 1 HDR RT + 1 shadow map
         hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ThrowIfFailed(m_device->CreateDescriptorHeap(&hd,
@@ -616,7 +618,7 @@ bool RenderingSystem::BuildRootSignatures()
     // ── Lighting (без изменений) ──────────────────────────────────────────
     {
         D3D12_DESCRIPTOR_RANGE srvRange{};
-        srvRange = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+        srvRange = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
 
         D3D12_ROOT_PARAMETER params[2]{};
         params[0].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -627,18 +629,28 @@ bool RenderingSystem::BuildRootSignatures()
         params[1].Descriptor.RegisterSpace  = 0;
         params[1].ShaderVisibility          = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        D3D12_STATIC_SAMPLER_DESC samp{};
-        samp.Filter         = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samp.MaxAnisotropy  = 1;
-        samp.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-        samp.MaxLOD         = D3D12_FLOAT32_MAX;
-        samp.ShaderRegister = 0;
-        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        // s0 — point clamp (G-Buffer сэмплирование)
+        D3D12_STATIC_SAMPLER_DESC samplers[2]{};
+        samplers[0].Filter         = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        samplers[0].AddressU = samplers[0].AddressV = samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplers[0].MaxAnisotropy  = 1;
+        samplers[0].ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samplers[0].MaxLOD         = D3D12_FLOAT32_MAX;
+        samplers[0].ShaderRegister = 0;
+        samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        // s1 — comparison sampler для PCF (SampleCmpLevelZero)
+        samplers[1].Filter         = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        samplers[1].AddressU = samplers[1].AddressV = samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplers[1].MaxAnisotropy  = 1;
+        samplers[1].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        samplers[1].MaxLOD         = D3D12_FLOAT32_MAX;
+        samplers[1].ShaderRegister = 1;
+        samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rsd{};
         rsd.NumParameters     = 2; rsd.pParameters = params;
-        rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &samp;
+        rsd.NumStaticSamplers = 2; rsd.pStaticSamplers = samplers;
         rsd.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
         ComPtr<ID3DBlob> ser, err;
@@ -788,7 +800,7 @@ bool RenderingSystem::CreateHdrRT()
     m_device->CreateRenderTargetView(m_hdrRT.Get(), nullptr, m_hdrRtv);
 
     // ── SRV в слоте [4N+4] ────────────────────────────────────────────────
-    const uint32_t slot = 4 * m_numMaterials + 4;
+    const uint32_t slot = 4 * m_numMaterials + 5;
     D3D12_CPU_DESCRIPTOR_HANDLE srvH =
         m_cbvSrvHeap->GetCPUDescriptorHandleForHeapStart();
     srvH.ptr += (SIZE_T)(slot * m_cbvSrvDescriptorSize);
@@ -909,6 +921,177 @@ bool RenderingSystem::BuildPostFxPSO()
         ThrowIfFailed(m_postFxCB->Map(0, &rr,
             reinterpret_cast<void**>(&m_mappedPostFxCB)), "Map PostFx CB");
     }
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CreateShadowMap — Texture2DArray глубины (kCsmCascades слоёв)
+// SRV кладём в cbvSrvHeap слот [4N+5]
+// ─────────────────────────────────────────────────────────────────────────────
+bool RenderingSystem::CreateShadowMap()
+{
+    m_shadowMap.Reset();
+
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width            = kShadowMapSize;
+    td.Height           = kShadowMapSize;
+    td.DepthOrArraySize = (UINT16)kCsmCascades;  // массив слоёв
+    td.MipLevels        = 1;
+    td.Format           = DXGI_FORMAT_R32_TYPELESS; // DSV=D32_FLOAT, SRV=R32_FLOAT
+    td.SampleDesc.Count = 1;
+    td.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    td.Flags            = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE cv{};
+    cv.Format              = DXGI_FORMAT_D32_FLOAT;
+    cv.DepthStencil.Depth  = 1.f;
+    cv.DepthStencil.Stencil = 0;
+
+    auto hp = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+    ThrowIfFailed(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
+        IID_PPV_ARGS(&m_shadowMap)), "Create Shadow Map Array");
+
+    // ── DSV heap: kCsmCascades дескрипторов, по одному на слой ──────────
+    if (!m_shadowDsvHeap)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.NumDescriptors = kCsmCascades;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        ThrowIfFailed(m_device->CreateDescriptorHeap(&hd,
+            IID_PPV_ARGS(&m_shadowDsvHeap)), "Shadow DSV Heap");
+    }
+
+    uint32_t dsvSize = m_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvBase =
+        m_shadowDsvHeap->GetCPUDescriptorHandleForHeapStart();
+
+    for (int i = 0; i < kCsmCascades; ++i)
+    {
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsvd{};
+        dsvd.Format                         = DXGI_FORMAT_D32_FLOAT;
+        dsvd.ViewDimension                  = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        dsvd.Texture2DArray.FirstArraySlice = (UINT)i;
+        dsvd.Texture2DArray.ArraySize       = 1;
+        dsvd.Texture2DArray.MipSlice        = 0;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE h = dsvBase;
+        h.ptr += (SIZE_T)(i * dsvSize);
+        m_device->CreateDepthStencilView(m_shadowMap.Get(), &dsvd, h);
+    }
+
+    // ── SRV — Texture2DArray, читается в lighting pass как t4 ─────────────
+    const uint32_t slot = 4 * m_numMaterials + 4;
+    D3D12_CPU_DESCRIPTOR_HANDLE srvH =
+        m_cbvSrvHeap->GetCPUDescriptorHandleForHeapStart();
+    srvH.ptr += (SIZE_T)(slot * m_cbvSrvDescriptorSize);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvd{};
+    srvd.Format                          = DXGI_FORMAT_R32_FLOAT;
+    srvd.ViewDimension                   = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    srvd.Shader4ComponentMapping         = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvd.Texture2DArray.MostDetailedMip  = 0;
+    srvd.Texture2DArray.MipLevels        = 1;
+    srvd.Texture2DArray.FirstArraySlice  = 0;
+    srvd.Texture2DArray.ArraySize        = kCsmCascades;
+    m_device->CreateShaderResourceView(m_shadowMap.Get(), &srvd, srvH);
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+bool RenderingSystem::BuildShadowPSO()
+{
+    UINT flags = 0;
+#if defined(_DEBUG)
+    flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+    ComPtr<ID3DBlob> err;
+    HRESULT hr = D3DCompileFromFile(L"Shadow.hlsl", nullptr,
+        D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        "VSMain_Shadow", "vs_5_0", flags, 0, &m_shadowVS, &err);
+    if (FAILED(hr)) {
+        if (err) throw std::runtime_error((char*)err->GetBufferPointer());
+        ThrowIfFailed(hr, "Compile Shadow VS");
+    }
+
+    // ── Root Signature: только b0 (ShadowCB = LightViewProj + World) ─────
+    {
+        D3D12_ROOT_PARAMETER param{};
+        param.ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        param.Descriptor.ShaderRegister = 0;
+        param.Descriptor.RegisterSpace  = 0;
+        param.ShaderVisibility          = D3D12_SHADER_VISIBILITY_VERTEX;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 1; rsd.pParameters = &param;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ComPtr<ID3DBlob> ser, rserr;
+        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
+            &ser, &rserr);
+        if (FAILED(hr)) {
+            if (rserr) throw std::runtime_error((char*)rserr->GetBufferPointer());
+            ThrowIfFailed(hr, "SerializeRS Shadow");
+        }
+        ThrowIfFailed(m_device->CreateRootSignature(0, ser->GetBufferPointer(),
+            ser->GetBufferSize(), IID_PPV_ARGS(&m_shadowRootSig)),
+            "CreateRS Shadow");
+    }
+
+    // ── PSO: только VS, нет color RT, глубина D32_FLOAT ──────────────────
+    {
+        // Input layout: только POSITION (первый элемент из m_inputLayout)
+        D3D12_INPUT_ELEMENT_DESC posOnly = m_inputLayout[0]; // POSITION
+
+        D3D12_RASTERIZER_DESC rast{};
+        rast.FillMode              = D3D12_FILL_MODE_SOLID;
+        rast.CullMode              = D3D12_CULL_MODE_FRONT; // Peter Pan fix
+        rast.FrontCounterClockwise = FALSE;
+        rast.DepthClipEnable       = TRUE;
+        rast.DepthBias             = 1000;      // константный bias (D32 формула)
+        rast.SlopeScaledDepthBias  = 2.0f;      // slope-scaled bias против acne
+        rast.DepthBiasClamp        = 0.01f;
+
+        D3D12_DEPTH_STENCIL_DESC ds{};
+        ds.DepthEnable    = TRUE;
+        ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        ds.DepthFunc      = D3D12_COMPARISON_FUNC_LESS;
+        ds.StencilEnable  = FALSE;
+
+        D3D12_BLEND_DESC blend{};  // нет color RT — blend не важен
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature        = m_shadowRootSig.Get();
+        pd.VS                    = { m_shadowVS->GetBufferPointer(),
+                                     m_shadowVS->GetBufferSize() };
+        pd.BlendState            = blend;
+        pd.RasterizerState       = rast;
+        pd.DepthStencilState     = ds;
+        pd.SampleMask            = UINT_MAX;
+        pd.InputLayout           = { &posOnly, 1 };
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets      = 0;   // нет color output
+        pd.DSVFormat             = DXGI_FORMAT_D32_FLOAT;
+        pd.SampleDesc.Count      = 1;
+
+        ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pd,
+            IID_PPV_ARGS(&m_shadowPSO)), "Create Shadow PSO");
+    }
+
+    // ── Shadow CB: два float4x4 (128 байт) выровнено до 256, × каскады × инстансы
+    UINT64 shadowCBSize = 256ULL * kCsmCascades * kMaxInstances;
+    auto up = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+    auto bd = BufDesc(shadowCBSize);
+    ThrowIfFailed(m_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        IID_PPV_ARGS(&m_shadowCB)), "Shadow CB");
+    D3D12_RANGE rr{0,0};
+    ThrowIfFailed(m_shadowCB->Map(0, &rr,
+        reinterpret_cast<void**>(&m_mappedShadowCB)), "Map Shadow CB");
 
     return true;
 }

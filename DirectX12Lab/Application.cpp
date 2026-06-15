@@ -87,6 +87,7 @@ void App::Update(float dt)
     const bool f3    = m_input->IsKeyDown(VK_F3);
     const bool f5    = m_input->IsKeyDown('Z');
     const bool f6    = m_input->IsKeyDown(VK_F5);
+    const bool f7    = m_input->IsKeyDown(VK_F6);
     const bool f4    = m_input->IsKeyDown(VK_F4);
     const bool plus  = m_input->IsKeyDown(VK_OEM_PLUS)  || m_input->IsKeyDown(VK_ADD);
     const bool minus = m_input->IsKeyDown(VK_OEM_MINUS) || m_input->IsKeyDown(VK_SUBTRACT);
@@ -121,9 +122,13 @@ void App::Update(float dt)
     if (f5 && !m_prevF5)
         m_renderer->ToggleWireframe();
 
-    // ── F5: cycle post-effects (off → fisheye → VHS → both) ──────────────
+    // ── F5: cycle post-effects ───────────────────────────────────────────
     if (f6 && !m_prevF6)
         m_renderer->CyclePostFx();
+
+    // ── F6: debug cascade colours ─────────────────────────────────────────
+    if (f7 && !m_prevF7)
+        m_renderer->ToggleDebugCascades();
 
     // ── +/- : tessellation factor (near) ──────────────────────────────────
     if (plus && !m_prevPlus)
@@ -151,6 +156,7 @@ void App::Update(float dt)
     m_prevF4    = f4;
     m_prevF5    = f5;
     m_prevF6    = f6;
+    m_prevF7    = f7;
     m_prevPlus  = plus;
     m_prevMinus = minus;
     m_prevRBrk  = rbrk;
@@ -171,7 +177,7 @@ void App::Update(float dt)
         swprintf_s(title,
             L"DX12 Deferred  |  Vis:%d  |  Cull:%hs  |"
             L"  Tess:%hs(%.0f)  |  Disp:%.1f  |  NM:%hs  |  Wire:%hs"
-            L"  |  F1=Frustum F2=Oct F3=Tess F4=NM F5=FX Z=Wire +/-=Factor []= Disp",
+            L"  |  F1=Frustum F2=Oct F3=Tess F4=NM F5=FX F6=CscDbg Z=Wire +/-=Factor []= Disp",
             m_renderer->GetVisibleCount(),
             cullMode,
             m_renderer->IsTessellationOn() ? "ON " : "OFF",

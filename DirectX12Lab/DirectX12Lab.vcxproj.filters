@@ -70,5 +70,6 @@
     <None Include="GBuffer.hlsl" />
     <None Include="Lighting.hlsl" />
     <None Include="PostFx.hlsl" />
+    <None Include="Shadow.hlsl" />
   </ItemGroup>
 </Project>

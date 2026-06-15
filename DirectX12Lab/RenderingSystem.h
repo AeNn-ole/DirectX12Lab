@@ -42,6 +42,8 @@ public:
     void  SetPostFxMode(int m)   { m_postFxMode = m; }
     int   GetPostFxMode()        const { return m_postFxMode; }
     void  CyclePostFx()          { m_postFxMode = (m_postFxMode + 1) % 4; }
+    void  ToggleDebugCascades()  { m_debugCascades = !m_debugCascades; }
+    bool  IsDebugCascadesOn()    const { return m_debugCascades; }
     bool  IsTessellationOn()     const { return m_tessellationEnabled; }
     bool  IsNormalMappingOn()    const { return m_normalMappingEnabled; }
     bool  IsWireframeOn()        const { return m_wireframe; }
@@ -82,6 +84,10 @@ private:
     D3D12_CPU_DESCRIPTOR_HANDLE CurrentBackBufferRTV() const;
     ID3D12Resource*              CurrentBackBuffer()    const;
     void RecreateDepthSRV();
+    bool CreateShadowMap();
+    bool BuildShadowPSO();
+    void UpdateCsmCascades();
+    void ShadowPass();
 
     // Пересоздать PSO при смене режима тесселяции
     void RebuildGeometryPSO();
@@ -94,6 +100,8 @@ private:
     static constexpr uint32_t kSwapChainBufferCount = 2;
     static constexpr int      kMaxInstances         = 1;
     static constexpr int      kMaxLights            = 16;
+    static constexpr int      kCsmCascades          = 4;
+    static constexpr uint32_t kShadowMapSize         = 2048;
 
     // ─────────────────────────────────────────────────────────────────────
     // Раскладка дескрипторной кучи CBV/SRV (shader-visible):
@@ -161,6 +169,23 @@ private:
         int                 NumLights = 0;
         float               _p1      = 0.f;
         Light               Lights[kMaxLights];
+
+        // CSM
+        DirectX::XMFLOAT4X4 LightViewProj[kCsmCascades];
+        DirectX::XMFLOAT4   CascadeFarPlanes;   // x,y,z,w = far plane 0..3
+        int                 NumCascades   = 0;
+        int                 DebugCascades = 0;
+        float               _p2[2]        = {};
+        float               ShadowMapSize = (float)kShadowMapSize;
+        float               ShadowBias    = 0.005f;
+        float               _p3[2]        = {};
+    };
+
+    // Данные одного каскада
+    struct CsmCascade
+    {
+        DirectX::XMFLOAT4X4 LightViewProj;
+        float                FarPlane;     // дистанция в world units (от камеры)
     };
 
     struct GpuMaterial
@@ -231,6 +256,20 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_lightingCB;
     uint8_t* m_mappedLightingCB   = nullptr;
+
+    // ── Shadow Map (Texture2DArray, kCsmCascades слоёв) ───────────────────
+    Microsoft::WRL::ComPtr<ID3D12Resource>       m_shadowMap;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_shadowDsvHeap; // 4 DSV
+    CsmCascade  m_cascades[kCsmCascades]{};
+
+    Microsoft::WRL::ComPtr<ID3D12RootSignature>  m_shadowRootSig;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState>  m_shadowPSO;
+    Microsoft::WRL::ComPtr<ID3DBlob>             m_shadowVS;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource>       m_shadowCB; // per-instance light CB
+    uint8_t*                                     m_mappedShadowCB = nullptr;
+
+    bool  m_debugCascades = false;
 
     ObjModel                 m_model;
     std::vector<GpuMaterial> m_gpuMaterials;
