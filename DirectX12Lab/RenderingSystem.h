@@ -10,6 +10,7 @@
 #include <DirectXMath.h>
 #include <cstdint>
 #include <vector>
+#include <algorithm>
 #include "ObjLoader.h"
 #include "GBuffer.h"
 #include "Octree.h"
@@ -44,6 +45,13 @@ public:
     void  CyclePostFx()          { m_postFxMode = (m_postFxMode + 1) % 4; }
     void  ToggleDebugCascades()  { m_debugCascades = !m_debugCascades; }
     bool  IsDebugCascadesOn()    const { return m_debugCascades; }
+
+    void  ToggleWater()          { m_waterEnabled = !m_waterEnabled; }
+    bool  IsWaterOn()            const { return m_waterEnabled; }
+    void  SetWaterSpeedMul(float m) { m_waterSpeedMul = (std::max)(0.f, m_waterSpeedMul + m); }
+    void  SetWaterAmpMul(float m)   { m_waterAmpMul   = (std::max)(0.f, m_waterAmpMul + m); }
+    float GetWaterSpeedMul()     const { return m_waterSpeedMul; }
+    float GetWaterAmpMul()       const { return m_waterAmpMul; }
     bool  IsTessellationOn()     const { return m_tessellationEnabled; }
     bool  IsNormalMappingOn()    const { return m_normalMappingEnabled; }
     bool  IsWireframeOn()        const { return m_wireframe; }
@@ -88,6 +96,10 @@ private:
     bool BuildShadowPSO();
     void UpdateCsmCascades();
     void ShadowPass();
+    bool BuildWaterGeometry();
+    bool BuildWaterPSO();
+    void UpdateWaterCB();
+    void WaterPass();
 
     // Пересоздать PSO при смене режима тесселяции
     void RebuildGeometryPSO();
@@ -168,6 +180,7 @@ private:
         DirectX::XMFLOAT2   ScreenSize;
         int                 NumLights = 0;
         float               _p1      = 0.f;
+        DirectX::XMFLOAT3   CameraForward; float _p1b = 0.f;
         Light               Lights[kMaxLights];
 
         // CSM
@@ -270,6 +283,55 @@ private:
     uint8_t*                                     m_mappedShadowCB = nullptr;
 
     bool  m_debugCascades = false;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Вода — процедурная тесселированная анимированная поверхность
+    // ═══════════════════════════════════════════════════════════════════
+    struct WaterVertex { DirectX::XMFLOAT3 Pos; };
+
+    struct alignas(16) WaterCB
+    {
+        DirectX::XMFLOAT4X4 World;
+        DirectX::XMFLOAT4X4 WorldViewProj;
+        DirectX::XMFLOAT3   EyePosW;   float Time = 0.f;
+        DirectX::XMFLOAT3   LightDirW; float _pad0 = 0.f;
+
+        DirectX::XMFLOAT4   WaveDir0Amp{  1.0f, 0.3f, 1.2f, 0.04f };
+        DirectX::XMFLOAT4   WaveDir1Amp{  0.4f, 1.0f, 0.7f, 0.08f };
+        DirectX::XMFLOAT4   WaveDir2Amp{ -0.7f, 0.6f, 0.4f, 0.15f };
+        DirectX::XMFLOAT4   WaveDir3Amp{  0.8f,-0.5f, 0.25f,0.30f };
+        DirectX::XMFLOAT4   WaveSpeeds { 1.0f, 1.4f, 2.0f, 2.6f };
+
+        float TessFactorNear = 12.f;
+        float TessFactorFar  = 1.f;
+        float TessDistNear   = 15.f;
+        float TessDistFar    = 250.f;
+
+        DirectX::XMFLOAT4 ShallowColor{ 0.25f, 0.55f, 0.55f, 1.f };
+        DirectX::XMFLOAT4 DeepColor   { 0.02f, 0.10f, 0.18f, 1.f };
+    };
+
+    static constexpr int kWaterGridN     = 64;     // N×N вершин сетки
+    static constexpr float kWaterWorldSize = 400.f; // размер плоскости в world units
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_waterVB;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_waterIB;
+    D3D12_VERTEX_BUFFER_VIEW m_waterVbv{};
+    D3D12_INDEX_BUFFER_VIEW  m_waterIbv{};
+    uint32_t                 m_waterIndexCount = 0;
+
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_waterRootSig;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_waterPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_waterWirePSO;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_waterVS, m_waterHS, m_waterDS, m_waterPS;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_waterCB;
+    uint8_t* m_mappedWaterCB = nullptr;
+
+    bool  m_waterEnabled   = true;
+    float m_waterSpeedMul  = 1.f;
+    float m_waterAmpMul    = 1.f;
+    float m_waterY         = 15.f; // высота плоскости воды (мировой Y)
 
     ObjModel                 m_model;
     std::vector<GpuMaterial> m_gpuMaterials;

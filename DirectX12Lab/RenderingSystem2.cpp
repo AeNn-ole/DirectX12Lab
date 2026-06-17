@@ -164,6 +164,19 @@ void RenderingSystem::UpdateLightingCB()
     lc.EyePosW    = m_eyePos;
     lc.ScreenSize = { (float)m_width, (float)m_height };
     lc.NumLights  = m_numLights;
+
+    // Forward вектор камеры = третья строка view матрицы (row 2)
+    // View матрица хранится transposed в m_view после XMStoreFloat4x4
+    // Row 2 view = (m[0][2], m[1][2], m[2][2]) в column-major
+    {
+        XMMATRIX v = XMLoadFloat4x4(&m_view);
+        XMVECTOR fwd = XMVector3Normalize(XMVectorSet(
+            XMVectorGetZ(v.r[0]),
+            XMVectorGetZ(v.r[1]),
+            XMVectorGetZ(v.r[2]), 0.f));
+        XMStoreFloat3(&lc.CameraForward, fwd);
+    }
+
     for (int i = 0; i < m_numLights; ++i) lc.Lights[i] = m_lights[i];
 
     // CSM
@@ -584,6 +597,90 @@ void RenderingSystem::ShadowPass()
     m_cmdList->ResourceBarrier(1, &toPSR);
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UpdateWaterCB — обновляет константы воды (время, матрицы, параметры волн)
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderingSystem::UpdateWaterCB()
+{
+    if (!m_mappedWaterCB) return;
+
+    static LARGE_INTEGER freqW{}, t0W{};
+    if (!freqW.QuadPart) {
+        QueryPerformanceFrequency(&freqW);
+        QueryPerformanceCounter(&t0W);
+    }
+    LARGE_INTEGER nowW; QueryPerformanceCounter(&nowW);
+    float t = (float)((nowW.QuadPart - t0W.QuadPart) / (double)freqW.QuadPart);
+
+    WaterCB cb{};
+
+    // Плоскость воды — Identity World, но сдвинута по Y на m_waterY
+    XMMATRIX world = XMMatrixTranslation(0.f, m_waterY, 0.f);
+    XMMATRIX view  = XMLoadFloat4x4(&m_view);
+    XMMATRIX proj  = XMLoadFloat4x4(&m_proj);
+    XMStoreFloat4x4(&cb.World,         XMMatrixTranspose(world));
+    XMStoreFloat4x4(&cb.WorldViewProj, XMMatrixTranspose(world * view * proj));
+
+    cb.EyePosW = m_eyePos;
+    cb.Time    = t * m_waterSpeedMul;
+    XMVECTOR L = XMVector3Normalize(XMLoadFloat3(&m_lightDir));
+    XMStoreFloat3(&cb.LightDirW, L);
+
+    // Амплитуды волн масштабируются множителем (хоткей [/])
+    cb.WaveDir0Amp = { 1.0f, 0.3f, 1.2f  * m_waterAmpMul, 0.04f };
+    cb.WaveDir1Amp = { 0.4f, 1.0f, 0.7f  * m_waterAmpMul, 0.08f };
+    cb.WaveDir2Amp = {-0.7f, 0.6f, 0.4f  * m_waterAmpMul, 0.15f };
+    cb.WaveDir3Amp = { 0.8f,-0.5f, 0.25f * m_waterAmpMul, 0.30f };
+    cb.WaveSpeeds  = { 1.0f, 1.4f, 2.0f, 2.6f };
+
+    cb.TessFactorNear = 12.f;
+    cb.TessFactorFar  = 1.f;
+    cb.TessDistNear   = 15.f;
+    cb.TessDistFar    = 250.f;
+
+    cb.ShallowColor = { 0.25f, 0.55f, 0.55f, 1.f };
+    cb.DeepColor    = { 0.02f, 0.10f, 0.18f, 1.f };
+
+    std::memcpy(m_mappedWaterCB, &cb, sizeof(cb));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WaterPass — forward-рендер воды поверх HDR RT (после deferred lighting).
+// Использует depth buffer основной сцены для корректного теста глубины
+// (вода скрывается за объектами, но сама не пишет в depth — DepthWriteMask=ZERO).
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderingSystem::WaterPass()
+{
+    if (!m_waterEnabled) return;
+
+    UpdateWaterCB();
+
+    // Рисуем в HDR RT (после deferred lighting) либо прямо в back buffer
+    // (wireframe mode — GeometryPass там рисует прямо в back buffer)
+    auto dsv = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
+    if (m_wireframe)
+    {
+        auto rtv = CurrentBackBufferRTV();
+        m_cmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    }
+    else
+    {
+        m_cmdList->OMSetRenderTargets(1, &m_hdrRtv, FALSE, &dsv);
+    }
+
+    m_cmdList->SetPipelineState(m_wireframe ? m_waterWirePSO.Get() : m_waterPSO.Get());
+    m_cmdList->SetGraphicsRootSignature(m_waterRootSig.Get());
+    m_cmdList->RSSetViewports(1, &m_viewport);
+    m_cmdList->RSSetScissorRects(1, &m_scissorRect);
+    m_cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+    m_cmdList->IASetVertexBuffers(0, 1, &m_waterVbv);
+    m_cmdList->IASetIndexBuffer(&m_waterIbv);
+
+    m_cmdList->SetGraphicsRootConstantBufferView(0, m_waterCB->GetGPUVirtualAddress());
+    m_cmdList->DrawIndexedInstanced(m_waterIndexCount, 1, 0, 0, 0);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::Draw()
 {
@@ -608,7 +705,10 @@ void RenderingSystem::Draw()
     GeometryPass();
     if (!m_wireframe) {
         LightingPass();
+        WaterPass();
         PostFxPass();
+    } else {
+        WaterPass(); // показываем воду тоже в wireframe для проверки тесселяции
     }
 
     D3D12_RESOURCE_BARRIER toPresent = toRT;

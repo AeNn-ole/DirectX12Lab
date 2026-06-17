@@ -111,6 +111,8 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     BuildPostFxPSO();
     CreateShadowMap();
     BuildShadowPSO();
+    BuildWaterGeometry();
+    BuildWaterPSO();
     InitLights();
 
     m_initialized = true;
@@ -1092,6 +1094,214 @@ bool RenderingSystem::BuildShadowPSO()
     D3D12_RANGE rr{0,0};
     ThrowIfFailed(m_shadowCB->Map(0, &rr,
         reinterpret_cast<void**>(&m_mappedShadowCB)), "Map Shadow CB");
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BuildWaterGeometry — процедурная плоская сетка N×N вершин в плоскости XZ.
+// Никаких UV/нормалей не нужно — Domain Shader вычисляет их аналитически.
+// ─────────────────────────────────────────────────────────────────────────────
+bool RenderingSystem::BuildWaterGeometry()
+{
+    const int N = kWaterGridN;
+    const float halfSize = kWaterWorldSize * 0.5f;
+    const float step = kWaterWorldSize / (float)(N - 1);
+
+    std::vector<WaterVertex> verts;
+    verts.reserve((size_t)N * N);
+    for (int z = 0; z < N; ++z)
+        for (int x = 0; x < N; ++x)
+        {
+            WaterVertex v{};
+            v.Pos = { -halfSize + x * step, 0.f, -halfSize + z * step };
+            verts.push_back(v);
+        }
+
+    std::vector<uint32_t> idx;
+    idx.reserve((size_t)(N - 1) * (N - 1) * 6);
+    for (int z = 0; z < N - 1; ++z)
+        for (int x = 0; x < N - 1; ++x)
+        {
+            uint32_t i0 = (uint32_t)(z * N + x);
+            uint32_t i1 = (uint32_t)(z * N + x + 1);
+            uint32_t i2 = (uint32_t)((z + 1) * N + x);
+            uint32_t i3 = (uint32_t)((z + 1) * N + x + 1);
+
+            // Два треугольника на квад (3 control points каждый — патчи)
+            idx.push_back(i0); idx.push_back(i2); idx.push_back(i1);
+            idx.push_back(i1); idx.push_back(i2); idx.push_back(i3);
+        }
+    m_waterIndexCount = (uint32_t)idx.size();
+
+    const UINT64 vbBytes = (UINT64)verts.size() * sizeof(WaterVertex);
+    const UINT64 ibBytes = (UINT64)idx.size()   * sizeof(uint32_t);
+
+    auto defHeap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+    auto upHeap  = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+    auto vbDesc  = BufDesc(vbBytes), ibDesc = BufDesc(ibBytes);
+
+    ThrowIfFailed(m_device->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &vbDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_waterVB)), "Water VB GPU");
+    ThrowIfFailed(m_device->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &ibDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_waterIB)), "Water IB GPU");
+
+    ComPtr<ID3D12Resource> vbUp, ibUp;
+    ThrowIfFailed(m_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &vbDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vbUp)), "Water VB Upload");
+    ThrowIfFailed(m_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &ibDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&ibUp)), "Water IB Upload");
+
+    auto upload = [](ID3D12Resource* r, const void* data, size_t sz) {
+        void* p; D3D12_RANGE rr{0,0};
+        r->Map(0, &rr, &p); std::memcpy(p, data, sz); r->Unmap(0, nullptr);
+    };
+    upload(vbUp.Get(), verts.data(), (size_t)vbBytes);
+    upload(ibUp.Get(),  idx.data(),  (size_t)ibBytes);
+
+    ThrowIfFailed(m_cmdAlloc->Reset(), "Alloc WaterGeom");
+    ThrowIfFailed(m_cmdList->Reset(m_cmdAlloc.Get(), nullptr), "List WaterGeom");
+
+    m_cmdList->CopyBufferRegion(m_waterVB.Get(), 0, vbUp.Get(), 0, vbBytes);
+    m_cmdList->CopyBufferRegion(m_waterIB.Get(), 0, ibUp.Get(), 0, ibBytes);
+
+    D3D12_RESOURCE_BARRIER bars[2]{};
+    bars[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bars[0].Transition = { m_waterVB.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER };
+    bars[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bars[1].Transition = { m_waterIB.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDEX_BUFFER };
+    m_cmdList->ResourceBarrier(2, bars);
+
+    ThrowIfFailed(m_cmdList->Close(), "CmdList Close WaterGeom");
+    ID3D12CommandList* ls[] = { m_cmdList.Get() };
+    m_cmdQueue->ExecuteCommandLists(1, ls);
+    FlushCommandQueue();
+
+    m_waterVbv = { m_waterVB->GetGPUVirtualAddress(), (UINT)vbBytes, sizeof(WaterVertex) };
+    m_waterIbv = { m_waterIB->GetGPUVirtualAddress(), (UINT)ibBytes, DXGI_FORMAT_R32_UINT };
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BuildWaterPSO — компилирует Water.hlsl (VS+HS+DS+PS), root signature,
+// PSO с alpha blending (вода прозрачная) и отдельный wireframe PSO.
+// ─────────────────────────────────────────────────────────────────────────────
+bool RenderingSystem::BuildWaterPSO()
+{
+    UINT flags = 0;
+#if defined(_DEBUG)
+    flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+    ComPtr<ID3DBlob> err;
+    auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& out)
+    {
+        err.Reset();
+        HRESULT hr = D3DCompileFromFile(L"Water.hlsl", nullptr,
+            D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, target, flags, 0, &out, &err);
+        if (FAILED(hr)) {
+            if (err) throw std::runtime_error((char*)err->GetBufferPointer());
+            ThrowIfFailed(hr, entry);
+        }
+    };
+    compile("VSMain_Water", "vs_5_0", m_waterVS);
+    compile("HSMain_Water", "hs_5_0", m_waterHS);
+    compile("DSMain_Water", "ds_5_0", m_waterDS);
+    compile("PSMain_Water", "ps_5_0", m_waterPS);
+
+    // ── Root Signature: одна inline CBV b0 (WaterCB) ─────────────────────
+    {
+        D3D12_ROOT_PARAMETER param{};
+        param.ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        param.Descriptor.ShaderRegister = 0;
+        param.ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 1; rsd.pParameters = &param;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ComPtr<ID3DBlob> ser, rserr;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &ser, &rserr);
+        if (FAILED(hr)) {
+            if (rserr) throw std::runtime_error((char*)rserr->GetBufferPointer());
+            ThrowIfFailed(hr, "SerializeRS Water");
+        }
+        ThrowIfFailed(m_device->CreateRootSignature(0, ser->GetBufferPointer(),
+            ser->GetBufferSize(), IID_PPV_ARGS(&m_waterRootSig)), "CreateRS Water");
+    }
+
+    // ── Input layout: только POSITION ────────────────────────────────────
+    D3D12_INPUT_ELEMENT_DESC waterLayout[1] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+    };
+
+    // ── PSO с alpha blending — вода рендерится в HDR RT (forward) ────────
+    {
+        D3D12_BLEND_DESC blend{};
+        auto& rt0 = blend.RenderTarget[0];
+        rt0.BlendEnable    = TRUE;
+        rt0.SrcBlend       = D3D12_BLEND_SRC_ALPHA;
+        rt0.DestBlend      = D3D12_BLEND_INV_SRC_ALPHA;
+        rt0.BlendOp        = D3D12_BLEND_OP_ADD;
+        rt0.SrcBlendAlpha  = D3D12_BLEND_ONE;
+        rt0.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rt0.BlendOpAlpha   = D3D12_BLEND_OP_ADD;
+        rt0.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+        D3D12_RASTERIZER_DESC rast{};
+        rast.FillMode = D3D12_FILL_MODE_SOLID;
+        rast.CullMode = D3D12_CULL_MODE_NONE; // видна с обеих сторон
+        rast.DepthClipEnable = TRUE;
+
+        D3D12_DEPTH_STENCIL_DESC ds{};
+        ds.DepthEnable    = TRUE;
+        ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO; // не пишем глубину (прозрачность)
+        ds.DepthFunc      = D3D12_COMPARISON_FUNC_LESS;
+        ds.StencilEnable  = FALSE;
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature        = m_waterRootSig.Get();
+        pd.VS                    = { m_waterVS->GetBufferPointer(), m_waterVS->GetBufferSize() };
+        pd.HS                    = { m_waterHS->GetBufferPointer(), m_waterHS->GetBufferSize() };
+        pd.DS                    = { m_waterDS->GetBufferPointer(), m_waterDS->GetBufferSize() };
+        pd.PS                    = { m_waterPS->GetBufferPointer(), m_waterPS->GetBufferSize() };
+        pd.BlendState            = blend;
+        pd.RasterizerState       = rast;
+        pd.DepthStencilState     = ds;
+        pd.SampleMask            = UINT_MAX;
+        pd.InputLayout           = { waterLayout, 1 };
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+        pd.NumRenderTargets      = 1;
+        pd.RTVFormats[0]         = DXGI_FORMAT_R16G16B16A16_FLOAT; // HDR RT формат
+        pd.DSVFormat             = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        pd.SampleDesc.Count      = 1;
+
+        ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pd,
+            IID_PPV_ARGS(&m_waterPSO)), "Create Water PSO");
+
+        // Wireframe-вариант для проверки тесселяции — рисуется прямо в back buffer
+        // (когда основной рендер тоже в wireframe режиме), формат R8G8B8A8_UNORM
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+        pd.BlendState.RenderTarget[0].BlendEnable = FALSE;
+        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM; // back buffer формат
+        ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pd,
+            IID_PPV_ARGS(&m_waterWirePSO)), "Create Water Wire PSO");
+    }
+
+    // ── Constant Buffer ───────────────────────────────────────────────────
+    {
+        auto up = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        auto bd = BufDesc((UINT64)((sizeof(WaterCB) + 255) & ~255));
+        ThrowIfFailed(m_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&m_waterCB)), "Water CB");
+        D3D12_RANGE rr{0,0};
+        ThrowIfFailed(m_waterCB->Map(0, &rr,
+            reinterpret_cast<void**>(&m_mappedWaterCB)), "Map Water CB");
+    }
 
     return true;
 }

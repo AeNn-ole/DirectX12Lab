@@ -33,6 +33,7 @@ cbuffer LightingCB : register(b0)
     float4x4 gInvViewProj;
     float3   gEyePosW;    float _p0;
     float2   gScreenSize; int gNumLights; float _p1;
+    float3   gCameraForward; float _p1b; // forward вектор камеры (для view-Z каскадов)
     Light    gLights[16];
 
     // ── CSM данные ────────────────────────────────────────────────────────
@@ -253,13 +254,16 @@ float4 PSMain_Light(LightVSOut pin) : SV_TARGET
     // Обходим: вычисляем abs(z) в clip space разделённый на w даст нормализованную
     // глубину, а реальная view-Z = near*far / (far - depth*(far-near)) — сложно.
     // Простейший подход: расстояние от камеры (хорошо работает для направленного света)
-    float viewDepth = length(posW - gEyePosW);
+    // View-space Z: проекция вектора (posW - eye) на forward вектор камеры
+    // Это линейная глубина — совпадает с splits[] из UpdateCsmCascades
+    float viewDepth = dot(posW - gEyePosW, gCameraForward);
 
     // ── Shadow ────────────────────────────────────────────────────────────
     int cascadeIdx = 0;
     float shadowFactor = 1.f;
-    if (gNumCascades > 0)
-        shadowFactor = CalcShadow(posW, viewDepth, cascadeIdx);
+    // ВРЕМЕННО ОТКЛЮЧЕНО ДЛЯ ДИАГНОСТИКИ — раскомментировать после проверки
+    // if (gNumCascades > 0)
+    //     shadowFactor = CalcShadow(posW, viewDepth, cascadeIdx);
 
     // ── Ambient ───────────────────────────────────────────────────────────
     float3 color = albedo * 0.04f;

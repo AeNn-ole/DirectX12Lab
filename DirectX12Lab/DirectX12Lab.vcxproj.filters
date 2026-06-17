@@ -71,5 +71,6 @@
     <None Include="Lighting.hlsl" />
     <None Include="PostFx.hlsl" />
     <None Include="Shadow.hlsl" />
+    <None Include="Water.hlsl" />
   </ItemGroup>
 </Project>
