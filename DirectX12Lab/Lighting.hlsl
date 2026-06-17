@@ -10,6 +10,7 @@ Texture2D       gNormal    : register(t1);
 Texture2D       gSpecular  : register(t2);
 Texture2D       gDepth     : register(t3);
 Texture2DArray  gShadowMap : register(t4); // массив shadow map по каскадам
+Texture2D       gShadowTex : register(t5); // текстура для затенённых областей
 
 SamplerState           gSampler       : register(s0); // point clamp (G-Buffer)
 SamplerComparisonState gShadowSampler : register(s1); // comparison sampler для PCF
@@ -33,6 +34,7 @@ cbuffer LightingCB : register(b0)
     float4x4 gInvViewProj;
     float3   gEyePosW;    float _p0;
     float2   gScreenSize; int gNumLights; float _p1;
+    float3   gCameraForward; float _p1b; // forward вектор камеры (для view-Z каскадов)
     Light    gLights[16];
 
     // ── CSM данные ────────────────────────────────────────────────────────
@@ -43,6 +45,7 @@ cbuffer LightingCB : register(b0)
     float2   _p2;
     float    gShadowMapSize;               // ширина/высота shadow map (для PCF offset)
     float    gShadowBias;                  // depth bias против acne
+    float    gShadowTexTiling;             // масштаб world-space UV для теневой текстуры
     float2   _p3;
 };
 
@@ -253,13 +256,21 @@ float4 PSMain_Light(LightVSOut pin) : SV_TARGET
     // Обходим: вычисляем abs(z) в clip space разделённый на w даст нормализованную
     // глубину, а реальная view-Z = near*far / (far - depth*(far-near)) — сложно.
     // Простейший подход: расстояние от камеры (хорошо работает для направленного света)
-    float viewDepth = length(posW - gEyePosW);
+    // View-space Z: проекция вектора (posW - eye) на forward вектор камеры
+    // Это линейная глубина — совпадает с splits[] из UpdateCsmCascades
+    float viewDepth = dot(posW - gEyePosW, gCameraForward);
 
     // ── Shadow ────────────────────────────────────────────────────────────
     int cascadeIdx = 0;
     float shadowFactor = 1.f;
     if (gNumCascades > 0)
+    {
         shadowFactor = CalcShadow(posW, viewDepth, cascadeIdx);
+        // Защита: если что-то пошло не так (NaN/Inf из вырожденной матрицы
+        // каскада) — не давать тени поломать весь кадр
+        if (!(shadowFactor >= 0.f) || !(shadowFactor <= 1.f))
+            shadowFactor = 1.f;
+    }
 
     // ── Ambient ───────────────────────────────────────────────────────────
     float3 color = albedo * 0.04f;
@@ -279,6 +290,21 @@ float4 PSMain_Light(LightVSOut pin) : SV_TARGET
 
     // Reinhard tonemapping
     color = color / (color + 1.0f);
+
+    // ── Доп. задание: текстура в затенённых областях ──────────────────────
+    // Там где shadowFactor близок к 0 (полная тень) — полностью заменяем
+    // итоговый цвет на сэмпл контрастной текстуры. UV берём из world-space
+    // XZ координат пикселя (projected/world-space texturing) — работает
+    // для любой геометрии независимо от её собственных UV.
+    {
+        float2 shadowTexUV = posW.xz * gShadowTexTiling;
+        float3 shadowTexColor = gShadowTex.Sample(gSampler, shadowTexUV).rgb;
+
+        // shadowFactor: 0 = полная тень → texColor, 1 = свет → обычный color
+        // smoothstep даёт плавную границу перехода вместо резкой
+        float texBlend = 1.f - smoothstep(0.0f, 0.5f, shadowFactor);
+        color = lerp(color, shadowTexColor, texBlend);
+    }
 
     // ── Debug: цветовая маркировка каскадов ──────────────────────────────
     if (gDebugCascades && gNumCascades > 0)

@@ -88,6 +88,11 @@ void App::Update(float dt)
     const bool f5    = m_input->IsKeyDown('Z');
     const bool f6    = m_input->IsKeyDown(VK_F5);
     const bool f7    = m_input->IsKeyDown(VK_F6);
+    const bool waterToggle = m_input->IsKeyDown('X');
+    const bool ampUp    = m_input->IsKeyDown(VK_OEM_PERIOD);  // .
+    const bool ampDown  = m_input->IsKeyDown(VK_OEM_COMMA);   // ,
+    const bool tileUp   = m_input->IsKeyDown('M');
+    const bool tileDown = m_input->IsKeyDown('N');
     const bool f4    = m_input->IsKeyDown(VK_F4);
     const bool plus  = m_input->IsKeyDown(VK_OEM_PLUS)  || m_input->IsKeyDown(VK_ADD);
     const bool minus = m_input->IsKeyDown(VK_OEM_MINUS) || m_input->IsKeyDown(VK_SUBTRACT);
@@ -130,6 +135,22 @@ void App::Update(float dt)
     if (f7 && !m_prevF7)
         m_renderer->ToggleDebugCascades();
 
+    // ── X: toggle water ───────────────────────────────────────────────────
+    if (waterToggle && !m_prevWaterToggle)
+        m_renderer->ToggleWater();
+
+    // ── , / . : амплитуда волн ───────────────────────────────────────────
+    if (ampUp && !m_prevAmpUp)
+        m_renderer->SetWaterAmpMul(0.2f);
+    if (ampDown && !m_prevAmpDown)
+        m_renderer->SetWaterAmpMul(-0.2f);
+
+    // ── M / N : масштаб тайлинга теневой текстуры ─────────────────────────
+    if (tileUp && !m_prevTileUp)
+        m_renderer->AdjustShadowTexTiling(0.02f);
+    if (tileDown && !m_prevTileDown)
+        m_renderer->AdjustShadowTexTiling(-0.02f);
+
     // ── +/- : tessellation factor (near) ──────────────────────────────────
     if (plus && !m_prevPlus)
     {
@@ -157,6 +178,11 @@ void App::Update(float dt)
     m_prevF5    = f5;
     m_prevF6    = f6;
     m_prevF7    = f7;
+    m_prevWaterToggle = waterToggle;
+    m_prevAmpUp       = ampUp;
+    m_prevAmpDown     = ampDown;
+    m_prevTileUp      = tileUp;
+    m_prevTileDown    = tileDown;
     m_prevPlus  = plus;
     m_prevMinus = minus;
     m_prevRBrk  = rbrk;
@@ -177,7 +203,7 @@ void App::Update(float dt)
         swprintf_s(title,
             L"DX12 Deferred  |  Vis:%d  |  Cull:%hs  |"
             L"  Tess:%hs(%.0f)  |  Disp:%.1f  |  NM:%hs  |  Wire:%hs"
-            L"  |  F1=Frustum F2=Oct F3=Tess F4=NM F5=FX F6=CscDbg Z=Wire +/-=Factor []= Disp",
+            L"  |  F1=Frustum F2=Oct F3=Tess F4=NM F5=FX F6=CscDbg X=Water ,/.=Amp Z=Wire +/-=Factor []=Disp",
             m_renderer->GetVisibleCount(),
             cullMode,
             m_renderer->IsTessellationOn() ? "ON " : "OFF",
@@ -192,7 +218,9 @@ void App::Update(float dt)
                     case 3: return "Both";
                     default: return "Off";
                 }
-            }());
+            }(),
+            m_renderer->IsWaterOn() ? "ON" : "OFF",
+            m_renderer->GetWaterAmpMul());
 
         SetWindowTextW(m_window->GetHwnd(), title);
     }
