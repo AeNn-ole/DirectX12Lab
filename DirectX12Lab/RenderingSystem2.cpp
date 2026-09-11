@@ -659,6 +659,190 @@ void RenderingSystem::UpdateWaterCB()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+void RenderingSystem::UpdateParticleSimCB(float dt, float totalTime)
+{
+    if (!m_mappedParticleSimCB) return;
+
+    ParticleSimCB cb{};
+    cb.EmitterPos     = m_particleEmitterPos;
+    cb.DeltaTime      = dt;
+    cb.EmitterVel     = { 0.f, 9.f, 0.f };
+    cb.TotalTime      = totalTime;
+    cb.Gravity        = { 0.f, -9.8f, 0.f };
+    cb.EmitCount      = m_particlesEnabled ? kParticlesPerFrame : 0;
+    cb.LifetimeMinMax = { 2.5f, 4.5f };
+    cb.SizeMinMax     = { 0.15f, 0.45f };
+    cb.ColorStart     = { 1.0f, 0.55f, 0.10f, 1.f };
+    cb.ColorEnd       = { 0.25f, 0.20f, 0.22f, 1.f };
+    cb.MaxParticles   = kMaxParticles;
+    cb.RandomSeed     = (uint32_t)(totalTime * 1000.f) ^ 0x9E3779B9u;
+    cb.EmitterSpread  = { 1.2f, 1.2f };
+
+    std::memcpy(m_mappedParticleSimCB, &cb, sizeof(cb));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ParticlesSimPass — три compute-диспатча: Update (indirect) → Emit → BuildArgs.
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderingSystem::ParticlesSimPass()
+{
+    if (!m_particlesEnabled) return;
+
+    static LARGE_INTEGER freqP{}, t0P{};
+    static uint64_t lastTickP = 0;
+    if (!freqP.QuadPart) { QueryPerformanceFrequency(&freqP); QueryPerformanceCounter(&t0P); lastTickP = t0P.QuadPart; }
+    LARGE_INTEGER nowP; QueryPerformanceCounter(&nowP);
+    float totalTime = (float)((nowP.QuadPart - t0P.QuadPart) / (double)freqP.QuadPart);
+    float dt = (float)((nowP.QuadPart - lastTickP) / (double)freqP.QuadPart);
+    lastTickP = nowP.QuadPart;
+    dt = (std::min)(dt, 1.f / 30.f); // защита от рывка dt после лага/паузы
+
+    UpdateParticleSimCB(dt, totalTime);
+
+    ID3D12DescriptorHeap* heaps[] = { m_particlesHeap.Get() };
+    m_cmdList->SetDescriptorHeaps(1, heaps);
+    m_cmdList->SetComputeRootSignature(m_particleSimRootSig.Get());
+    m_cmdList->SetComputeRootConstantBufferView(0, m_particleSimCB->GetGPUVirtualAddress());
+
+    const int inIdx  = m_particlePing;
+    const int outIdx = 1 - m_particlePing;
+
+    auto slotCpu = [&](uint32_t i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_particlesHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)(i * m_particlesDescSize);
+        return h;
+    };
+    auto makeStructuredUAV = [&](ID3D12Resource* res, ID3D12Resource* counter,
+                                  uint32_t numElements, uint32_t stride, uint32_t heapSlot)
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.ViewDimension               = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements          = numElements;
+        ud.Buffer.StructureByteStride  = stride;
+        ud.Buffer.CounterOffsetInBytes = 0;
+        m_device->CreateUnorderedAccessView(res, counter, &ud, slotCpu(heapSlot));
+    };
+
+    // Перестыковка ping-pong слотов: [1]=In, [2]=Out, [7]=счётчик Out как plain-буфер
+    makeStructuredUAV(m_particleAlive[inIdx].Get(),  m_particleAliveCounter[inIdx].Get(),
+                       kMaxParticles, sizeof(uint32_t), 1);
+    makeStructuredUAV(m_particleAlive[outIdx].Get(), m_particleAliveCounter[outIdx].Get(),
+                       kMaxParticles, sizeof(uint32_t), 2);
+    makeStructuredUAV(m_particleAliveCounter[outIdx].Get(), nullptr, 1, sizeof(uint32_t), 7);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE tableBase = m_particlesHeap->GetGPUDescriptorHandleForHeapStart();
+    m_cmdList->SetComputeRootDescriptorTable(1, tableBase);
+
+    D3D12_RESOURCE_BARRIER uavBar{};
+    uavBar.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavBar.UAV.pResource = nullptr; // глобальный UAV-барьер
+
+    // ── 1) CSUpdate — количество групп задаётся с GPU через ExecuteIndirect ─
+    D3D12_RESOURCE_BARRIER argToIndirect{};
+    argToIndirect.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    argToIndirect.Transition = { m_particleDispatchArgs.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT };
+    m_cmdList->ResourceBarrier(1, &argToIndirect);
+
+    m_cmdList->SetPipelineState(m_particleUpdatePSO.Get());
+    m_cmdList->ExecuteIndirect(m_particleDispatchCmdSig.Get(), 1,
+        m_particleDispatchArgs.Get(), 0, nullptr, 0);
+
+    D3D12_RESOURCE_BARRIER argBack = argToIndirect;
+    argBack.Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    argBack.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_cmdList->ResourceBarrier(1, &argBack);
+    m_cmdList->ResourceBarrier(1, &uavBar);
+
+    // ── 2) CSEmit — фиксированный размер (kParticlesPerFrame), с CPU ────────
+    m_cmdList->SetPipelineState(m_particleEmitPSO.Get());
+    const uint32_t emitGroups = (kParticlesPerFrame + 255u) / 256u;
+    m_cmdList->Dispatch(emitGroups, 1, 1);
+    m_cmdList->ResourceBarrier(1, &uavBar);
+
+    // ── 3) CSBuildIndirectArgs — DrawArgs (этот кадр) + DispatchArgs (следующий) ─
+    m_cmdList->SetPipelineState(m_particleArgsPSO.Get());
+    m_cmdList->Dispatch(1, 1, 1);
+    m_cmdList->ResourceBarrier(1, &uavBar);
+
+    // SRV [8] для рендер-пасса = буфер "out" (то, что мы только что заполнили)
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
+    sd.Buffer.NumElements         = kMaxParticles;
+    sd.Buffer.StructureByteStride = sizeof(uint32_t);
+    m_device->CreateShaderResourceView(m_particleAlive[outIdx].Get(), &sd, slotCpu(8));
+
+    m_particlePing = outIdx;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ParticlesRenderPass — DrawInstancedIndirect(POINTLIST) в HDR RT, опаково.
+// ─────────────────────────────────────────────────────────────────────────────
+void RenderingSystem::ParticlesRenderPass()
+{
+    if (!m_particlesEnabled) return;
+
+    // HDR RT: PSR → RT (симметрично выходу LightingPass)
+    D3D12_RESOURCE_BARRIER toRT{};
+    toRT.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toRT.Transition = { m_hdrRT.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET };
+    m_cmdList->ResourceBarrier(1, &toRT);
+
+    auto dsv = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
+    m_cmdList->OMSetRenderTargets(1, &m_hdrRtv, FALSE, &dsv);
+
+    ParticleRenderCB cb{};
+    XMMATRIX view = XMLoadFloat4x4(&m_view);
+    XMMATRIX proj = XMLoadFloat4x4(&m_proj);
+    XMStoreFloat4x4(&cb.ViewProj, XMMatrixTranspose(view * proj));
+    // m_view хранится БЕЗ транспонирования (см. SetCamera) → мировые оси
+    // камеры лежат в столбцах матрицы: Right = col0, Up = col1
+    cb.CameraRight = { m_view._11, m_view._21, m_view._31 };
+    cb.CameraUp    = { m_view._12, m_view._22, m_view._32 };
+    cb.EyePosW     = m_eyePos;
+    XMVECTOR L = XMVector3Normalize(XMLoadFloat3(&m_lightDir));
+    XMStoreFloat3(&cb.LightDirW, L);
+    cb.AmbientColor = { 0.15f, 0.15f, 0.18f, 1.f };
+    std::memcpy(m_mappedParticleRenderCB, &cb, sizeof(cb));
+
+    m_cmdList->SetPipelineState(m_particleRenderPSO.Get());
+    m_cmdList->SetGraphicsRootSignature(m_particleRenderRootSig.Get());
+    m_cmdList->RSSetViewports(1, &m_viewport);
+    m_cmdList->RSSetScissorRects(1, &m_scissorRect);
+    m_cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+
+    ID3D12DescriptorHeap* heaps[] = { m_particlesHeap.Get() };
+    m_cmdList->SetDescriptorHeaps(1, heaps);
+    m_cmdList->SetGraphicsRootConstantBufferView(0, m_particleRenderCBRes->GetGPUVirtualAddress());
+
+    D3D12_GPU_DESCRIPTOR_HANDLE srvBase = m_particlesHeap->GetGPUDescriptorHandleForHeapStart();
+    srvBase.ptr += (SIZE_T)(8 * m_particlesDescSize); // t0=AliveIndices, t1=Pool
+    m_cmdList->SetGraphicsRootDescriptorTable(1, srvBase);
+
+    D3D12_RESOURCE_BARRIER toIndirect{};
+    toIndirect.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toIndirect.Transition = { m_particleDrawArgs.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT };
+    m_cmdList->ResourceBarrier(1, &toIndirect);
+
+    m_cmdList->ExecuteIndirect(m_particleDrawCmdSig.Get(), 1,
+        m_particleDrawArgs.Get(), 0, nullptr, 0);
+
+    D3D12_RESOURCE_BARRIER backToUav = toIndirect;
+    backToUav.Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    backToUav.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_cmdList->ResourceBarrier(1, &backToUav);
+
+    // HDR RT: RT → PSR — для Water/PostFx ниже по стеку
+    D3D12_RESOURCE_BARRIER toPSR = toRT;
+    toPSR.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    toPSR.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_cmdList->ResourceBarrier(1, &toPSR);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // WaterPass — forward-рендер воды поверх HDR RT (после deferred lighting).
 // Использует depth buffer основной сцены для корректного теста глубины
 // (вода скрывается за объектами, но сама не пишет в depth — DepthWriteMask=ZERO).
@@ -718,6 +902,8 @@ void RenderingSystem::Draw()
     GeometryPass();
     if (!m_wireframe) {
         LightingPass();
+        ParticlesSimPass();      // ← частицы: COMPUTE update+emit+args
+        ParticlesRenderPass();   // ← частицы: GS billboard render (opaque)
         WaterPass();
         PostFxPass();
     } else {

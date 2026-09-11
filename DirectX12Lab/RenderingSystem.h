@@ -54,6 +54,10 @@ public:
     void  SetWaterAmpMul(float m)   { m_waterAmpMul   = (std::max)(0.f, m_waterAmpMul + m); }
     float GetWaterSpeedMul()     const { return m_waterSpeedMul; }
     float GetWaterAmpMul()       const { return m_waterAmpMul; }
+
+    void  ToggleParticles()      { m_particlesEnabled = !m_particlesEnabled; }
+    bool  IsParticlesOn()        const { return m_particlesEnabled; }
+
     bool  IsTessellationOn()     const { return m_tessellationEnabled; }
     bool  IsNormalMappingOn()    const { return m_normalMappingEnabled; }
     bool  IsWireframeOn()        const { return m_wireframe; }
@@ -109,6 +113,14 @@ private:
     bool CreateHdrRT();
     bool BuildPostFxPSO();
     void PostFxPass();
+
+    // ── Частицы (Homework #6) ────────────────────────────────────────────
+    bool BuildParticleBuffers();
+    bool BuildParticleRootSignatures();
+    bool BuildParticlePSOs();
+    void UpdateParticleSimCB(float dt, float totalTime);
+    void ParticlesSimPass();
+    void ParticlesRenderPass();
 
 private:
     // ── Константы ─────────────────────────────────────────────────────────
@@ -342,6 +354,83 @@ private:
     // SRV кладётся в cbvSrvHeap слот [4N+6], читается в Lighting.hlsl как t5.
     Microsoft::WRL::ComPtr<ID3D12Resource> m_shadowTex;
     float m_shadowTexTiling = 0.1f; // масштаб world-space UV для тайлинга
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Частицы — GPU-driven simulation (Homework #6)
+    // ═══════════════════════════════════════════════════════════════════
+    static constexpr uint32_t kMaxParticles      = 65536;
+    static constexpr uint32_t kParticlesPerFrame = 48; // темп эмиссии
+
+    struct alignas(16) GpuParticle
+    {
+        DirectX::XMFLOAT3 Position;
+        float             Age;
+        DirectX::XMFLOAT3 Velocity;
+        float             Lifetime;
+        DirectX::XMFLOAT4 Color;
+        float             Size;
+        DirectX::XMFLOAT3 _pad{};
+    };
+
+    struct alignas(16) ParticleSimCB
+    {
+        DirectX::XMFLOAT3 EmitterPos{ 0.f, 6.f, 0.f };   float DeltaTime = 0.f;
+        DirectX::XMFLOAT3 EmitterVel{ 0.f, 9.f, 0.f };   float TotalTime = 0.f;
+        DirectX::XMFLOAT3 Gravity{ 0.f, -9.8f, 0.f };    uint32_t EmitCount = 0;
+        DirectX::XMFLOAT2 LifetimeMinMax{ 2.5f, 4.5f };
+        DirectX::XMFLOAT2 SizeMinMax{ 0.15f, 0.45f };
+        DirectX::XMFLOAT4 ColorStart{ 1.0f, 0.55f, 0.10f, 1.f };
+        DirectX::XMFLOAT4 ColorEnd{ 0.25f, 0.20f, 0.22f, 1.f };
+        uint32_t MaxParticles = 0;
+        uint32_t RandomSeed   = 0;
+        DirectX::XMFLOAT2 EmitterSpread{ 1.2f, 1.2f };
+    };
+
+    struct alignas(16) ParticleRenderCB
+    {
+        DirectX::XMFLOAT4X4 ViewProj;
+        DirectX::XMFLOAT3   CameraRight; float _p0 = 0.f;
+        DirectX::XMFLOAT3   CameraUp;    float _p1 = 0.f;
+        DirectX::XMFLOAT3   EyePosW;     float _p2 = 0.f;
+        DirectX::XMFLOAT3   LightDirW;   float _p3 = 0.f;
+        DirectX::XMFLOAT4   AmbientColor{ 0.15f, 0.15f, 0.18f, 1.f };
+    };
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_particlePool;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_particleAlive[2];
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_particleAliveCounter[2];
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_particleDead;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_particleDeadCounter;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_particleDrawArgs;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_particleDispatchArgs;
+
+    // Отдельная shader-visible куча CBV/SRV/UAV только для частиц (10 слотов,
+    // раскладка описана в BuildParticleRootSignatures) — не трогает layout
+    // основной m_cbvSrvHeap.
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_particlesHeap;
+    uint32_t m_particlesDescSize = 0;
+
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_particleSimRootSig;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_particleRenderRootSig;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_particleUpdatePSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_particleEmitPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_particleArgsPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_particleRenderPSO;
+
+    Microsoft::WRL::ComPtr<ID3D12CommandSignature> m_particleDrawCmdSig;
+    Microsoft::WRL::ComPtr<ID3D12CommandSignature> m_particleDispatchCmdSig;
+
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particleCSUpdate, m_particleCSEmit, m_particleCSArgs;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particleVS, m_particleGS, m_particlePS;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_particleSimCB;
+    uint8_t* m_mappedParticleSimCB = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_particleRenderCBRes;
+    uint8_t* m_mappedParticleRenderCB = nullptr;
+
+    int   m_particlePing     = 0;    // 0 или 1 — кто сейчас физически "AliveOut"
+    bool  m_particlesEnabled = true;
+    DirectX::XMFLOAT3 m_particleEmitterPos{ 0.f, 6.f, 0.f };
 
     ObjModel                 m_model;
     std::vector<GpuMaterial> m_gpuMaterials;

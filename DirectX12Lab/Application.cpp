@@ -89,6 +89,10 @@ void App::Update(float dt)
     const bool f6    = m_input->IsKeyDown(VK_F5);
     const bool f7    = m_input->IsKeyDown(VK_F6);
     const bool waterToggle = m_input->IsKeyDown('X');
+    const bool particlesToggle = m_input->IsKeyDown('C');
+    // static (не член класса App) — Application.h не трогаем; переживает
+    // вызовы Update() так же, как обычный член, т.к. App существует в одном экземпляре
+    static bool s_prevParticlesToggle = false;
     const bool ampUp    = m_input->IsKeyDown(VK_OEM_PERIOD);  // .
     const bool ampDown  = m_input->IsKeyDown(VK_OEM_COMMA);   // ,
     const bool tileUp   = m_input->IsKeyDown('M');
@@ -139,6 +143,10 @@ void App::Update(float dt)
     if (waterToggle && !m_prevWaterToggle)
         m_renderer->ToggleWater();
 
+    // ── C: toggle частиц ─────────────────────────────────────────────────
+    if (particlesToggle && !s_prevParticlesToggle)
+        m_renderer->ToggleParticles();
+
     // ── , / . : амплитуда волн ───────────────────────────────────────────
     if (ampUp && !m_prevAmpUp)
         m_renderer->SetWaterAmpMul(0.2f);
@@ -179,6 +187,7 @@ void App::Update(float dt)
     m_prevF6    = f6;
     m_prevF7    = f7;
     m_prevWaterToggle = waterToggle;
+    s_prevParticlesToggle = particlesToggle;
     m_prevAmpUp       = ampUp;
     m_prevAmpDown     = ampDown;
     m_prevTileUp      = tileUp;
@@ -203,7 +212,7 @@ void App::Update(float dt)
         swprintf_s(title,
             L"DX12 Deferred  |  Vis:%d  |  Cull:%hs  |"
             L"  Tess:%hs(%.0f)  |  Disp:%.1f  |  NM:%hs  |  Wire:%hs"
-            L"  |  F1=Frustum F2=Oct F3=Tess F4=NM F5=FX F6=CscDbg X=Water ,/.=Amp Z=Wire +/-=Factor []=Disp",
+            L"  |  F1=Frustum F2=Oct F3=Tess F4=NM F5=FX F6=CscDbg X=Water C=Particles ,/.=Amp Z=Wire +/-=Factor []=Disp",
             m_renderer->GetVisibleCount(),
             cullMode,
             m_renderer->IsTessellationOn() ? "ON " : "OFF",

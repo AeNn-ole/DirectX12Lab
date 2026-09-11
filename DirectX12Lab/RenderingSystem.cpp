@@ -114,6 +114,9 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     BuildWaterGeometry();
     BuildWaterPSO();
     CreateShadowAreaTexture();
+    BuildParticleBuffers();          // ← частицы (Homework #6)
+    BuildParticleRootSignatures();
+    BuildParticlePSOs();
     InitLights();
 
     m_initialized = true;
@@ -1330,6 +1333,324 @@ bool RenderingSystem::CreateShadowAreaTexture()
     srvd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvd.Texture2D.MipLevels     = 1;
     m_device->CreateShaderResourceView(m_shadowTex.Get(), &srvd, srvH);
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BuildParticleBuffers — все GPU-ресурсы системы частиц (Homework #6).
+// DeadList изначально заполнен индексами 0..kMaxParticles-1 (все слоты
+// свободны), его счётчик = kMaxParticles. Alive-буферы и их счётчики,
+// DrawArgs/DispatchArgs явно обнуляются (не полагаемся на недокументированное
+// поведение "свежая GPU-память = ноль", хотя оно де-факто выполняется в D3D12).
+// ─────────────────────────────────────────────────────────────────────────────
+bool RenderingSystem::BuildParticleBuffers()
+{
+    auto defHeap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+    auto upHeap  = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+
+    auto makeUavBuffer = [&](UINT64 bytes, ComPtr<ID3D12Resource>& out,
+                              D3D12_RESOURCE_STATES initState, const char* tag)
+    {
+        auto bd = BufDesc(bytes);
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        ThrowIfFailed(m_device->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &bd,
+            initState, nullptr, IID_PPV_ARGS(&out)), tag);
+    };
+
+    makeUavBuffer((UINT64)kMaxParticles * sizeof(GpuParticle), m_particlePool,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "Particle Pool");
+    makeUavBuffer((UINT64)kMaxParticles * sizeof(uint32_t), m_particleAlive[0],
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "Alive A");
+    makeUavBuffer((UINT64)kMaxParticles * sizeof(uint32_t), m_particleAlive[1],
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "Alive B");
+
+    // Эти шесть создаём в COPY_DEST — сразу зальём в них начальные данные
+    makeUavBuffer((UINT64)kMaxParticles * sizeof(uint32_t), m_particleDead,
+        D3D12_RESOURCE_STATE_COPY_DEST, "Dead List");
+    makeUavBuffer(4,  m_particleAliveCounter[0], D3D12_RESOURCE_STATE_COPY_DEST, "Alive Counter A");
+    makeUavBuffer(4,  m_particleAliveCounter[1], D3D12_RESOURCE_STATE_COPY_DEST, "Alive Counter B");
+    makeUavBuffer(4,  m_particleDeadCounter,     D3D12_RESOURCE_STATE_COPY_DEST, "Dead Counter");
+    makeUavBuffer(16, m_particleDrawArgs,        D3D12_RESOURCE_STATE_COPY_DEST, "Particle DrawArgs");
+    makeUavBuffer(16, m_particleDispatchArgs,    D3D12_RESOURCE_STATE_COPY_DEST, "Particle DispatchArgs");
+
+    // ── Начальные данные ─────────────────────────────────────────────────
+    std::vector<uint32_t> deadIndices(kMaxParticles);
+    for (uint32_t i = 0; i < kMaxParticles; ++i) deadIndices[i] = i;
+    const uint32_t fullCount = kMaxParticles;
+    const uint32_t zero      = 0;
+    const uint32_t zero4[4]  = { 0, 0, 0, 0 };
+
+    ComPtr<ID3D12Resource> upDeadData, upDeadCnt, upAliveCntA, upAliveCntB, upDrawZero, upDispatchZero;
+
+    auto makeUpload = [&](UINT64 bytes, const void* data, ComPtr<ID3D12Resource>& out)
+    {
+        auto bd = BufDesc(bytes);
+        ThrowIfFailed(m_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&out)), "Particle Upload");
+        void* p; D3D12_RANGE rr{0,0};
+        out->Map(0, &rr, &p);
+        std::memcpy(p, data, (size_t)bytes);
+        out->Unmap(0, nullptr);
+    };
+
+    makeUpload((UINT64)kMaxParticles * sizeof(uint32_t), deadIndices.data(), upDeadData);
+    makeUpload(4,  &fullCount, upDeadCnt);
+    makeUpload(4,  &zero,      upAliveCntA);
+    makeUpload(4,  &zero,      upAliveCntB);
+    makeUpload(16, zero4,      upDrawZero);
+    makeUpload(16, zero4,      upDispatchZero);
+
+    ThrowIfFailed(m_cmdAlloc->Reset(), "Alloc Particles Init");
+    ThrowIfFailed(m_cmdList->Reset(m_cmdAlloc.Get(), nullptr), "List Particles Init");
+
+    m_cmdList->CopyBufferRegion(m_particleDead.Get(), 0, upDeadData.Get(), 0,
+        (UINT64)kMaxParticles * sizeof(uint32_t));
+    m_cmdList->CopyBufferRegion(m_particleDeadCounter.Get(),     0, upDeadCnt.Get(),      0, 4);
+    m_cmdList->CopyBufferRegion(m_particleAliveCounter[0].Get(), 0, upAliveCntA.Get(),    0, 4);
+    m_cmdList->CopyBufferRegion(m_particleAliveCounter[1].Get(), 0, upAliveCntB.Get(),    0, 4);
+    m_cmdList->CopyBufferRegion(m_particleDrawArgs.Get(),        0, upDrawZero.Get(),     0, 16);
+    m_cmdList->CopyBufferRegion(m_particleDispatchArgs.Get(),    0, upDispatchZero.Get(), 0, 16);
+
+    ID3D12Resource* toBar[] = {
+        m_particleDead.Get(), m_particleDeadCounter.Get(),
+        m_particleAliveCounter[0].Get(), m_particleAliveCounter[1].Get(),
+        m_particleDrawArgs.Get(), m_particleDispatchArgs.Get()
+    };
+    D3D12_RESOURCE_BARRIER bars[6]{};
+    for (int i = 0; i < 6; ++i)
+    {
+        bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bars[i].Transition = { toBar[i], D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                               D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+    }
+    m_cmdList->ResourceBarrier(6, bars);
+
+    ThrowIfFailed(m_cmdList->Close(), "Close Particles Init");
+    ID3D12CommandList* ls[] = { m_cmdList.Get() };
+    m_cmdQueue->ExecuteCommandLists(1, ls);
+    FlushCommandQueue();
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BuildParticleRootSignatures
+//
+// Отдельная shader-visible куча m_particlesHeap (10 дескрипторов):
+//   [0] UAV u0 Pool             — статично
+//   [1] UAV u1 AliveIn          — перезаписывается каждый кадр (ParticlesSimPass)
+//   [2] UAV u2 AliveOut         — перезаписывается каждый кадр
+//   [3] UAV u3 DeadAppend       — статично
+//   [4] UAV u4 DeadConsume      — статично (тот же буфер, что и [3])
+//   [5] UAV u5 DrawArgs         — статично
+//   [6] UAV u6 DispatchArgs     — статично
+//   [7] UAV u7 AliveOutCounter  — перезаписывается каждый кадр (plain-view счётчика)
+//   [8] SRV t0 AliveIndices     — перезаписывается каждый кадр (для рендера)
+//   [9] SRV t1 Pool             — статично (для рендера)
+// ─────────────────────────────────────────────────────────────────────────────
+bool RenderingSystem::BuildParticleRootSignatures()
+{
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.NumDescriptors = 10;
+    hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ThrowIfFailed(m_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_particlesHeap)), "Particles Heap");
+    m_particlesDescSize = m_cbvSrvDescriptorSize;
+
+    auto slot = [&](uint32_t i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_particlesHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)(i * m_particlesDescSize);
+        return h;
+    };
+    auto makeStructuredUAV = [&](ID3D12Resource* res, ID3D12Resource* counter,
+                                  uint32_t numElements, uint32_t stride, uint32_t heapSlot)
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.ViewDimension               = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements          = numElements;
+        ud.Buffer.StructureByteStride  = stride;
+        ud.Buffer.CounterOffsetInBytes = 0;
+        m_device->CreateUnorderedAccessView(res, counter, &ud, slot(heapSlot));
+    };
+    auto makeStructuredSRV = [&](ID3D12Resource* res, uint32_t numElements,
+                                  uint32_t stride, uint32_t heapSlot)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Shader4ComponentMapping     = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.ViewDimension               = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Buffer.NumElements          = numElements;
+        sd.Buffer.StructureByteStride  = stride;
+        m_device->CreateShaderResourceView(res, &sd, slot(heapSlot));
+    };
+
+    makeStructuredUAV(m_particlePool.Get(), nullptr, kMaxParticles, sizeof(GpuParticle), 0);
+    makeStructuredUAV(m_particleDead.Get(), m_particleDeadCounter.Get(), kMaxParticles, sizeof(uint32_t), 3);
+    makeStructuredUAV(m_particleDead.Get(), m_particleDeadCounter.Get(), kMaxParticles, sizeof(uint32_t), 4);
+    makeStructuredUAV(m_particleDrawArgs.Get(),     nullptr, 4, sizeof(uint32_t), 5);
+    makeStructuredUAV(m_particleDispatchArgs.Get(), nullptr, 4, sizeof(uint32_t), 6);
+    makeStructuredSRV(m_particlePool.Get(), kMaxParticles, sizeof(GpuParticle), 9);
+    // Слоты [1],[2],[7],[8] переписываются каждый кадр в ParticlesSimPass().
+
+    // ── Compute root signature: b0 (CBV) + table u0..u7 ────────────────────
+    {
+        D3D12_DESCRIPTOR_RANGE range{ D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 8, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable  = { 1, &range };
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2; rsd.pParameters = params;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+        ComPtr<ID3DBlob> ser, err;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &ser, &err);
+        if (FAILED(hr)) { if (err) throw std::runtime_error((char*)err->GetBufferPointer()); ThrowIfFailed(hr, "SerializeRS ParticleSim"); }
+        ThrowIfFailed(m_device->CreateRootSignature(0, ser->GetBufferPointer(),
+            ser->GetBufferSize(), IID_PPV_ARGS(&m_particleSimRootSig)), "CreateRS ParticleSim");
+    }
+
+    // ── Render root signature: b0 (CBV) + table t0,t1 ───────────────────────
+    {
+        D3D12_DESCRIPTOR_RANGE range{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable  = { 1, &range };
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2; rsd.pParameters = params;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+        ComPtr<ID3DBlob> ser, err;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &ser, &err);
+        if (FAILED(hr)) { if (err) throw std::runtime_error((char*)err->GetBufferPointer()); ThrowIfFailed(hr, "SerializeRS ParticleRender"); }
+        ThrowIfFailed(m_device->CreateRootSignature(0, ser->GetBufferPointer(),
+            ser->GetBufferSize(), IID_PPV_ARGS(&m_particleRenderRootSig)), "CreateRS ParticleRender");
+    }
+
+    // ── Command signatures для ExecuteIndirect ──────────────────────────────
+    {
+        D3D12_INDIRECT_ARGUMENT_DESC arg{ D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH };
+        D3D12_COMMAND_SIGNATURE_DESC csd{};
+        csd.ByteStride = 16; csd.NumArgumentDescs = 1; csd.pArgumentDescs = &arg;
+        ThrowIfFailed(m_device->CreateCommandSignature(&csd, nullptr,
+            IID_PPV_ARGS(&m_particleDispatchCmdSig)), "CmdSig Dispatch");
+    }
+    {
+        D3D12_INDIRECT_ARGUMENT_DESC arg{ D3D12_INDIRECT_ARGUMENT_TYPE_DRAW };
+        D3D12_COMMAND_SIGNATURE_DESC csd{};
+        csd.ByteStride = 16; csd.NumArgumentDescs = 1; csd.pArgumentDescs = &arg;
+        ThrowIfFailed(m_device->CreateCommandSignature(&csd, nullptr,
+            IID_PPV_ARGS(&m_particleDrawCmdSig)), "CmdSig Draw");
+    }
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BuildParticlePSOs — компилирует шейдеры (ParticlesSim.hlsl/ParticlesRender.hlsl),
+// создаёт 3 compute PSO + 1 render PSO (POINTLIST+GS, opaque), плюс два CB.
+// ─────────────────────────────────────────────────────────────────────────────
+bool RenderingSystem::BuildParticlePSOs()
+{
+    UINT flags = 0;
+#if defined(_DEBUG)
+    flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+    ComPtr<ID3DBlob> err;
+    auto compile = [&](const wchar_t* file, const char* entry, const char* target, ComPtr<ID3DBlob>& out)
+    {
+        err.Reset();
+        HRESULT hr = D3DCompileFromFile(file, nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            entry, target, flags, 0, &out, &err);
+        if (FAILED(hr)) {
+            if (err) throw std::runtime_error((char*)err->GetBufferPointer());
+            ThrowIfFailed(hr, entry);
+        }
+    };
+
+    compile(L"ParticlesSim.hlsl", "CSUpdate",           "cs_5_0", m_particleCSUpdate);
+    compile(L"ParticlesSim.hlsl", "CSEmit",              "cs_5_0", m_particleCSEmit);
+    compile(L"ParticlesSim.hlsl", "CSBuildIndirectArgs", "cs_5_0", m_particleCSArgs);
+
+    compile(L"ParticlesRender.hlsl", "VSMain_Particle", "vs_5_0", m_particleVS);
+    compile(L"ParticlesRender.hlsl", "GSMain_Particle", "gs_5_0", m_particleGS);
+    compile(L"ParticlesRender.hlsl", "PSMain_Particle", "ps_5_0", m_particlePS);
+
+    auto makeComputePSO = [&](ID3DBlob* cs, ComPtr<ID3D12PipelineState>& out, const char* tag)
+    {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+        cd.pRootSignature = m_particleSimRootSig.Get();
+        cd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+        ThrowIfFailed(m_device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&out)), tag);
+    };
+    makeComputePSO(m_particleCSUpdate.Get(), m_particleUpdatePSO, "Particle Update PSO");
+    makeComputePSO(m_particleCSEmit.Get(),   m_particleEmitPSO,   "Particle Emit PSO");
+    makeComputePSO(m_particleCSArgs.Get(),   m_particleArgsPSO,   "Particle Args PSO");
+
+    // ── Render PSO: POINTLIST + GS, opaque (без blend, пишет depth) ────────
+    {
+        D3D12_BLEND_DESC blend{};
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+        D3D12_DEPTH_STENCIL_DESC ds{};
+        ds.DepthEnable    = TRUE;
+        ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        ds.DepthFunc      = D3D12_COMPARISON_FUNC_LESS;
+        ds.StencilEnable  = FALSE;
+
+        D3D12_RASTERIZER_DESC rast{};
+        rast.FillMode        = D3D12_FILL_MODE_SOLID;
+        rast.CullMode        = D3D12_CULL_MODE_NONE;
+        rast.DepthClipEnable = TRUE;
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature    = m_particleRenderRootSig.Get();
+        pd.VS                = { m_particleVS->GetBufferPointer(), m_particleVS->GetBufferSize() };
+        pd.GS                = { m_particleGS->GetBufferPointer(), m_particleGS->GetBufferSize() };
+        pd.PS                = { m_particlePS->GetBufferPointer(), m_particlePS->GetBufferSize() };
+        pd.BlendState        = blend;
+        pd.RasterizerState   = rast;
+        pd.DepthStencilState = ds;
+        pd.SampleMask        = UINT_MAX;
+        pd.InputLayout       = { nullptr, 0 };
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        pd.NumRenderTargets  = 1;
+        pd.RTVFormats[0]     = DXGI_FORMAT_R16G16B16A16_FLOAT; // HDR RT
+        pd.DSVFormat         = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        pd.SampleDesc.Count  = 1;
+
+        ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pd,
+            IID_PPV_ARGS(&m_particleRenderPSO)), "Create Particle Render PSO");
+    }
+
+    // ── Constant buffers ─────────────────────────────────────────────────────
+    {
+        auto up = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        auto bd = BufDesc(AlignCB(sizeof(ParticleSimCB)));
+        ThrowIfFailed(m_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_particleSimCB)), "Particle Sim CB");
+        D3D12_RANGE rr{0,0};
+        ThrowIfFailed(m_particleSimCB->Map(0, &rr, reinterpret_cast<void**>(&m_mappedParticleSimCB)), "Map ParticleSimCB");
+    }
+    {
+        auto up = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        auto bd = BufDesc(AlignCB(sizeof(ParticleRenderCB)));
+        ThrowIfFailed(m_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_particleRenderCBRes)), "Particle Render CB");
+        D3D12_RANGE rr2{0,0};
+        ThrowIfFailed(m_particleRenderCBRes->Map(0, &rr2, reinterpret_cast<void**>(&m_mappedParticleRenderCB)), "Map ParticleRenderCB");
+    }
 
     return true;
 }
