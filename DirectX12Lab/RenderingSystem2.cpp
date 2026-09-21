@@ -676,7 +676,8 @@ void RenderingSystem::UpdateParticleSimCB(float dt, float totalTime)
     cb.ColorEnd       = { 0.25f, 0.20f, 0.22f, 1.f };
     cb.MaxParticles   = kMaxParticles;
     cb.RandomSeed     = (uint32_t)(totalTime * 1000.f) ^ 0x9E3779B9u;
-    cb.EmitterSpread  = { 1.2f, 1.2f };
+    cb.EmitterSpread  = { 222.2f, 111.2f };
+    cb.TeapotIndexCount = m_teapotIndexCount; // размер меша чайника — константа
 
     std::memcpy(m_mappedParticleSimCB, &cb, sizeof(cb));
 }
@@ -811,7 +812,9 @@ void RenderingSystem::ParticlesRenderPass()
     m_cmdList->SetGraphicsRootSignature(m_particleRenderRootSig.Get());
     m_cmdList->RSSetViewports(1, &m_viewport);
     m_cmdList->RSSetScissorRects(1, &m_scissorRect);
-    m_cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    m_cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_cmdList->IASetVertexBuffers(0, 1, &m_teapotVBView);
+    m_cmdList->IASetIndexBuffer(&m_teapotIBView);
 
     ID3D12DescriptorHeap* heaps[] = { m_particlesHeap.Get() };
     m_cmdList->SetDescriptorHeaps(1, heaps);

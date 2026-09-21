@@ -116,6 +116,7 @@ private:
 
     // ── Частицы (Homework #6) ────────────────────────────────────────────
     bool BuildParticleBuffers();
+    bool BuildTeapotMesh();
     bool BuildParticleRootSignatures();
     bool BuildParticlePSOs();
     void UpdateParticleSimCB(float dt, float totalTime);
@@ -384,6 +385,8 @@ private:
         uint32_t MaxParticles = 0;
         uint32_t RandomSeed   = 0;
         DirectX::XMFLOAT2 EmitterSpread{ 1.2f, 1.2f };
+        uint32_t TeapotIndexCount = 0;              // ← новое: размер меша чайника (константа)
+        DirectX::XMFLOAT3 _padSim{};                 // добивание строки до 16 байт
     };
 
     struct alignas(16) ParticleRenderCB
@@ -395,6 +398,19 @@ private:
         DirectX::XMFLOAT3   LightDirW;   float _p3 = 0.f;
         DirectX::XMFLOAT4   AmbientColor{ 0.15f, 0.15f, 0.18f, 1.f };
     };
+
+    // ── Меш "чайника" (вместо billboard-квада) — процедурная геометрия,
+    //    строится один раз в BuildTeapotMesh(), рисуется instancing'ом ──────
+    struct TeapotVertex
+    {
+        DirectX::XMFLOAT3 Pos;
+        DirectX::XMFLOAT3 Normal;
+    };
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_teapotVB;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_teapotIB;
+    D3D12_VERTEX_BUFFER_VIEW m_teapotVBView{};
+    D3D12_INDEX_BUFFER_VIEW  m_teapotIBView{};
+    uint32_t m_teapotIndexCount = 0;
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_particlePool;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_particleAlive[2];
@@ -421,7 +437,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12CommandSignature> m_particleDispatchCmdSig;
 
     Microsoft::WRL::ComPtr<ID3DBlob> m_particleCSUpdate, m_particleCSEmit, m_particleCSArgs;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_particleVS, m_particleGS, m_particlePS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particleVS, m_particlePS; // GS больше не нужен — рисуем реальный меш
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_particleSimCB;
     uint8_t* m_mappedParticleSimCB = nullptr;

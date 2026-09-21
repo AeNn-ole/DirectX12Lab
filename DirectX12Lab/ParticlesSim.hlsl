@@ -1,48 +1,3 @@
-// ═══════════════════════════════════════════════════════════════════════════
-// ParticlesSim.hlsl — GPU Particle Simulation (Homework #6)
-//
-// Три compute-кернела, один root signature (u0..u7), вызываются в таком
-// порядке каждый кадр (см. RenderingSystem::ParticlesSimPass):
-//
-//   1) CSUpdate              — интегрирует живые частицы, решает кто умер
-//   2) CSEmit                — рождает новые частицы из free-list (DeadList)
-//   3) CSBuildIndirectArgs   — считает indirect-аргументы для Draw/Dispatch
-//
-// ── Буферы (два StructuredBuffer, Append/Consume — по заданию) ─────────────
-//
-//   gPool        (u0) RWStructuredBuffer<Particle>   — вся память частиц,
-//                      адресуется индексом 0..MaxParticles-1, НЕ Append/Consume
-//
-//   gAliveIn     (u1) ConsumeStructuredBuffer<uint>   ⎫ ping-pong пара:
-//   gAliveOut    (u2) AppendStructuredBuffer<uint>    ⎭ индексы живых частиц.
-//                      Роли (u1/u2) меняются местами каждый кадр на CPU —
-//                      это и есть "один Append, один Consume" из задания.
-//
-//   gDeadAppend  (u3) AppendStructuredBuffer<uint>    ⎫ ОДИН физический буфер
-//   gDeadConsume (u4) ConsumeStructuredBuffer<uint>   ⎭ (free-list мёртвых
-//                      индексов), но два разных UAV-дескриптора на него же:
-//                      Update кладёт туда умерших (Append),
-//                      Emit  забирает оттуда свободный слот (Consume).
-//
-//   gDrawArgs        (u5) RWStructuredBuffer<uint>[4] — D3D12_DRAW_ARGUMENTS
-//   gDispatchArgs    (u6) RWStructuredBuffer<uint>[4] — GroupsX,Y,Z + AliveCount
-//   gAliveOutCounter (u7) RWStructuredBuffer<uint>[1] — «сырое» число элементов
-//                      в gAliveOut за этот кадр (не через Append/Consume API,
-//                      а прямым чтением counter-ресурса как обычного буфера —
-//                      см. пояснение в Particle_Integration.md)
-//
-// Почему индексы дважды безопасны: как только счётчик Consume-буфера
-// доходит до 0, чтение "ушедшее за границу" по спецификации D3D12
-// возвращает 0, а запись "за границу" отбрасывается — GPU не падает.
-// Для gAliveIn это устранено полностью (CSUpdate стартует ровно
-// AliveCount потоков благодаря ExecuteIndirect+bounds-check).
-// Для gDeadConsume в момент насыщения (все MaxParticles заняты) это
-// может дать один "призрачный" Consume(), возвращающий индекс 0 —
-// safe, но может привести к минорному визуальному дребезгу частицы #0
-// на пике заполнения. Задокументировано, это стандартный и общепринятый
-// trade-off для учебных GPU-particle систем.
-// ═══════════════════════════════════════════════════════════════════════════
-
 struct Particle
 {
     float3 Position;
@@ -66,6 +21,8 @@ cbuffer ParticleSimCB : register(b0)
     uint   gMaxParticles;
     uint   gRandomSeed;
     float2 gEmitterSpread;
+    uint   gTeapotIndexCount; // размер меша чайника (константа) — для DrawIndexedInstanced args
+    float3 _padSim;
 };
 
 RWStructuredBuffer<Particle>   gPool             : register(u0);
@@ -149,7 +106,7 @@ void CSEmit(uint3 dtid : SV_DispatchThreadID)
 
     Particle p;
     p.Position = gEmitterPos + dir * float3(gEmitterSpread.x, 0.f, gEmitterSpread.y) * Hash11(seed + 7u);
-    p.Velocity = gEmitterVel + dir * 88.5f;
+    p.Velocity = gEmitterVel + dir * 2.5f;
     p.Age      = 0.f;
     p.Lifetime = lerp(gLifetimeMinMax.x, gLifetimeMinMax.y, Hash11(seed + 13u));
     p.Color    = gColorStart;
@@ -163,8 +120,11 @@ void CSEmit(uint3 dtid : SV_DispatchThreadID)
 // ─────────────────────────────────────────────────────────────────────────────
 // CSBuildIndirectArgs — один поток, вызывается в конце кадра, когда
 // и CSUpdate, и CSEmit уже дописали всё в gAliveOut. Готовит:
-//   - DrawArgs      — для DrawInstancedIndirect этого же кадра (рендерим
-//                     то, что только что насчитали)
+//   - DrawArgs      — для DrawIndexedInstancedIndirect этого же кадра: рисуем
+//                     ОДИН И ТОТ ЖЕ меш чайника (IndexCountPerInstance — константа,
+//                     gTeapotIndexCount), но InstanceCount — ДИНАМИЧЕСКИЙ,
+//                     равен числу живых частиц (роли Vertex/Instance по
+//                     сравнению с billboard-версией поменялись местами!)
 //   - DispatchArgs  — для CSUpdate СЛЕДУЮЩЕГО кадра (сколько групп нужно
 //                     задиспатчить, чтобы обработать именно gAliveOut)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -173,10 +133,13 @@ void CSBuildIndirectArgs(uint3 dtid : SV_DispatchThreadID)
 {
     uint count = min(gAliveOutCounter[0], gMaxParticles);
 
-    gDrawArgs[0] = count; // VertexCountPerInstance — по одной точке на частицу
-    gDrawArgs[1] = 1;     // InstanceCount
-    gDrawArgs[2] = 0;     // StartVertexLocation
-    gDrawArgs[3] = 0;     // StartInstanceLocation
+    // D3D12_DRAW_INDEXED_ARGUMENTS: {IndexCountPerInstance, InstanceCount,
+    //                                 StartIndexLocation, BaseVertexLocation, StartInstanceLocation}
+    gDrawArgs[0] = gTeapotIndexCount; // геометрия чайника фиксирована — константа
+    gDrawArgs[1] = count;             // а вот число ИНСТАНСОВ — динамическое (живые частицы)
+    gDrawArgs[2] = 0;                 // StartIndexLocation
+    gDrawArgs[3] = 0;                 // BaseVertexLocation
+    gDrawArgs[4] = 0;                 // StartInstanceLocation
 
     gDispatchArgs[0] = (count + 255u) / 256u; // GroupsX
     gDispatchArgs[1] = 1;

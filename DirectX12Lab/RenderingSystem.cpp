@@ -115,6 +115,7 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     BuildWaterPSO();
     CreateShadowAreaTexture();
     BuildParticleBuffers();          // ← частицы (Homework #6)
+    BuildTeapotMesh();                // ← процедурный чайник вместо billboard-квада
     BuildParticleRootSignatures();
     BuildParticlePSOs();
     InitLights();
@@ -1371,7 +1372,7 @@ bool RenderingSystem::BuildParticleBuffers()
     makeUavBuffer(4,  m_particleAliveCounter[0], D3D12_RESOURCE_STATE_COPY_DEST, "Alive Counter A");
     makeUavBuffer(4,  m_particleAliveCounter[1], D3D12_RESOURCE_STATE_COPY_DEST, "Alive Counter B");
     makeUavBuffer(4,  m_particleDeadCounter,     D3D12_RESOURCE_STATE_COPY_DEST, "Dead Counter");
-    makeUavBuffer(16, m_particleDrawArgs,        D3D12_RESOURCE_STATE_COPY_DEST, "Particle DrawArgs");
+    makeUavBuffer(20, m_particleDrawArgs,        D3D12_RESOURCE_STATE_COPY_DEST, "Particle DrawArgs");
     makeUavBuffer(16, m_particleDispatchArgs,    D3D12_RESOURCE_STATE_COPY_DEST, "Particle DispatchArgs");
 
     // ── Начальные данные ─────────────────────────────────────────────────
@@ -1380,6 +1381,7 @@ bool RenderingSystem::BuildParticleBuffers()
     const uint32_t fullCount = kMaxParticles;
     const uint32_t zero      = 0;
     const uint32_t zero4[4]  = { 0, 0, 0, 0 };
+    const uint32_t zero5[5]  = { 0, 0, 0, 0, 0 }; // теперь DrawArgs = DrawIndexedInstanced-аргументы (5 uint)
 
     ComPtr<ID3D12Resource> upDeadData, upDeadCnt, upAliveCntA, upAliveCntB, upDrawZero, upDispatchZero;
 
@@ -1398,7 +1400,7 @@ bool RenderingSystem::BuildParticleBuffers()
     makeUpload(4,  &fullCount, upDeadCnt);
     makeUpload(4,  &zero,      upAliveCntA);
     makeUpload(4,  &zero,      upAliveCntB);
-    makeUpload(16, zero4,      upDrawZero);
+    makeUpload(20, zero5,      upDrawZero);
     makeUpload(16, zero4,      upDispatchZero);
 
     ThrowIfFailed(m_cmdAlloc->Reset(), "Alloc Particles Init");
@@ -1409,7 +1411,7 @@ bool RenderingSystem::BuildParticleBuffers()
     m_cmdList->CopyBufferRegion(m_particleDeadCounter.Get(),     0, upDeadCnt.Get(),      0, 4);
     m_cmdList->CopyBufferRegion(m_particleAliveCounter[0].Get(), 0, upAliveCntA.Get(),    0, 4);
     m_cmdList->CopyBufferRegion(m_particleAliveCounter[1].Get(), 0, upAliveCntB.Get(),    0, 4);
-    m_cmdList->CopyBufferRegion(m_particleDrawArgs.Get(),        0, upDrawZero.Get(),     0, 16);
+    m_cmdList->CopyBufferRegion(m_particleDrawArgs.Get(),        0, upDrawZero.Get(),     0, 20);
     m_cmdList->CopyBufferRegion(m_particleDispatchArgs.Get(),    0, upDispatchZero.Get(), 0, 16);
 
     ID3D12Resource* toBar[] = {
@@ -1430,6 +1432,213 @@ bool RenderingSystem::BuildParticleBuffers()
     ID3D12CommandList* ls[] = { m_cmdList.Get() };
     m_cmdQueue->ExecuteCommandLists(1, ls);
     FlushCommandQueue();
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Процедурная геометрия "чайника" — тело (приплюснутая сфера) + крышка
+// (сфера поменьше) + носик (конус) + ручка (дуга тора). Никаких внешних
+// .obj-файлов не требуется — вся геометрия считается математически один
+// раз при старте и заливается в статичный VB/IB (переиспользуется потом
+// instancing'ом — один и тот же меш рисуется N раз, N = число живых частиц).
+// ─────────────────────────────────────────────────────────────────────────────
+namespace
+{
+    // Локальный тип с той же раскладкой, что и приватный RenderingSystem::TeapotVertex
+    // (POS+NORMAL по 12 байт) — свободные функции-генераторы геометрии не являются
+    // членами класса и не могут напрямую использовать его приватный вложенный тип,
+    // поэтому здесь используется layout-совместимый двойник, а в BuildTeapotMesh()
+    // (который УЖЕ является методом класса и имеет доступ к приватному типу)
+    // данные просто reinterpret_cast'ятся — раскладка байт идентична.
+    struct GenTeapotVertex
+    {
+        DirectX::XMFLOAT3 Pos;
+        DirectX::XMFLOAT3 Normal;
+    };
+
+    void AddSphere(std::vector<GenTeapotVertex>& verts, std::vector<uint32_t>& idx,
+                   DirectX::XMFLOAT3 center, float radius, float squashY, int stacks, int slices)
+    {
+        using namespace DirectX;
+        uint32_t base = (uint32_t)verts.size();
+        for (int i = 0; i <= stacks; ++i)
+        {
+            float v = (float)i / stacks;
+            float theta = v * XM_PI;
+            for (int j = 0; j <= slices; ++j)
+            {
+                float u = (float)j / slices;
+                float phi = u * XM_2PI;
+                float nx = sinf(theta) * cosf(phi);
+                float ny = cosf(theta);
+                float nz = sinf(theta) * sinf(phi);
+                GenTeapotVertex tv;
+                tv.Normal = { nx, ny, nz }; // нормаль недеформированной сферы — приближение, глазом незаметно
+                tv.Pos = { center.x + radius * nx, center.y + radius * squashY * ny, center.z + radius * nz };
+                verts.push_back(tv);
+            }
+        }
+        for (int i = 0; i < stacks; ++i)
+            for (int j = 0; j < slices; ++j)
+            {
+                uint32_t a = base + i * (slices + 1) + j;
+                uint32_t b = a + slices + 1;
+                idx.push_back(a); idx.push_back(b); idx.push_back(a + 1);
+                idx.push_back(a + 1); idx.push_back(b); idx.push_back(b + 1);
+            }
+    }
+
+    // Конус вдоль произвольной оси axisDir, без донышек (основание прячется
+    // внутри тела чайника — не видно, поэтому крышки не нужны)
+    void AddCone(std::vector<GenTeapotVertex>& verts, std::vector<uint32_t>& idx,
+                 DirectX::XMFLOAT3 baseCenter, DirectX::XMFLOAT3 axisDir, float length,
+                 float baseRadius, float tipRadius, int slices)
+    {
+        using namespace DirectX;
+        XMVECTOR axis = XMVector3Normalize(XMLoadFloat3(&axisDir));
+        XMVECTOR up = XMVectorSet(0, 1, 0, 0);
+        XMVECTOR right = XMVector3Normalize(XMVector3Cross(up, axis));
+        if (XMVectorGetX(XMVector3LengthSq(right)) < 1e-6f)
+            right = XMVector3Normalize(XMVector3Cross(XMVectorSet(1, 0, 0, 0), axis));
+        XMVECTOR fwd = XMVector3Cross(axis, right);
+
+        XMVECTOR baseC = XMLoadFloat3(&baseCenter);
+        XMVECTOR tipC  = XMVectorAdd(baseC, XMVectorScale(axis, length));
+
+        uint32_t base = (uint32_t)verts.size();
+        for (int j = 0; j <= slices; ++j)
+        {
+            float phi = (float)j / slices * XM_2PI;
+            XMVECTOR n = XMVectorAdd(XMVectorScale(right, cosf(phi)), XMVectorScale(fwd, sinf(phi)));
+            XMVECTOR pos = XMVectorAdd(baseC, XMVectorScale(n, baseRadius));
+            GenTeapotVertex tv; XMStoreFloat3(&tv.Pos, pos); XMStoreFloat3(&tv.Normal, n);
+            verts.push_back(tv);
+        }
+        for (int j = 0; j <= slices; ++j)
+        {
+            float phi = (float)j / slices * XM_2PI;
+            XMVECTOR n = XMVectorAdd(XMVectorScale(right, cosf(phi)), XMVectorScale(fwd, sinf(phi)));
+            XMVECTOR pos = XMVectorAdd(tipC, XMVectorScale(n, tipRadius));
+            GenTeapotVertex tv; XMStoreFloat3(&tv.Pos, pos); XMStoreFloat3(&tv.Normal, n);
+            verts.push_back(tv);
+        }
+        for (int j = 0; j < slices; ++j)
+        {
+            uint32_t a = base + j, b = base + j + 1;
+            uint32_t c = base + slices + 1 + j, d = c + 1;
+            idx.push_back(a); idx.push_back(c); idx.push_back(b);
+            idx.push_back(b); idx.push_back(c); idx.push_back(d);
+        }
+    }
+
+    // Дуга тора в плоскости XY (для вертикальной ручки сбоку чайника),
+    // ось "трубки" — вбок по Z.
+    void AddHandleArc(std::vector<GenTeapotVertex>& verts, std::vector<uint32_t>& idx,
+                       float xOffset, float yCenter, float armRadius, float tubeRadius,
+                       float startAngle, float endAngle, int segs, int slices)
+    {
+        using namespace DirectX;
+        uint32_t base = (uint32_t)verts.size();
+        for (int i = 0; i <= segs; ++i)
+        {
+            float t = startAngle + (endAngle - startAngle) * (float)i / segs;
+            XMFLOAT3 ringCenter = { xOffset + armRadius * cosf(t), yCenter + armRadius * sinf(t), 0.f };
+            XMVECTOR outward = XMVectorSet(cosf(t), sinf(t), 0, 0);
+            XMVECTOR side    = XMVectorSet(0, 0, 1, 0);
+            for (int j = 0; j <= slices; ++j)
+            {
+                float phi = (float)j / slices * XM_2PI;
+                XMVECTOR n = XMVectorAdd(XMVectorScale(outward, cosf(phi)), XMVectorScale(side, sinf(phi)));
+                XMVECTOR pos = XMVectorAdd(XMLoadFloat3(&ringCenter), XMVectorScale(n, tubeRadius));
+                GenTeapotVertex tv; XMStoreFloat3(&tv.Pos, pos); XMStoreFloat3(&tv.Normal, n);
+                verts.push_back(tv);
+            }
+        }
+        for (int i = 0; i < segs; ++i)
+            for (int j = 0; j < slices; ++j)
+            {
+                uint32_t a = base + i * (slices + 1) + j;
+                uint32_t b = a + slices + 1;
+                idx.push_back(a); idx.push_back(b); idx.push_back(a + 1);
+                idx.push_back(a + 1); idx.push_back(b); idx.push_back(b + 1);
+            }
+    }
+} // namespace
+
+bool RenderingSystem::BuildTeapotMesh()
+{
+    using namespace DirectX;
+
+    std::vector<GenTeapotVertex> verts;
+    std::vector<uint32_t>     idx;
+
+    // Тело — приплюснутая сфера (радиус 1, приплюснута по Y до 0.75)
+    AddSphere(verts, idx, { 0.f, 0.f, 0.f }, 1.0f, 0.75f, 14, 20);
+    // Крышка — сфера поменьше сверху
+    AddSphere(verts, idx, { 0.f, 0.82f, 0.f }, 0.32f, 0.55f, 8, 12);
+    // Носик — конус, торчащий вправо-вперёд-вверх
+    AddCone(verts, idx, { 0.85f, 0.05f, 0.f }, { 0.75f, 0.55f, 0.f }, 0.85f, 0.16f, 0.05f, 10);
+    // Ручка — дуга тора слева, вертикальная петля
+    AddHandleArc(verts, idx, -1.15f, 0.05f, 0.5f, 0.09f,
+                 XM_PIDIV2 * 0.55f, XM_PI - XM_PIDIV2 * 0.55f, 16, 8);
+
+    m_teapotIndexCount = (uint32_t)idx.size();
+
+    auto defHeap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+    auto upHeap  = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+
+    const UINT64 vbBytes = (UINT64)verts.size() * sizeof(GenTeapotVertex);
+    const UINT64 ibBytes = (UINT64)idx.size()   * sizeof(uint32_t);
+
+    auto vbDesc = BufDesc(vbBytes);
+    ThrowIfFailed(m_device->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &vbDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_teapotVB)), "Teapot VB");
+    auto ibDesc = BufDesc(ibBytes);
+    ThrowIfFailed(m_device->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &ibDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_teapotIB)), "Teapot IB");
+
+    ComPtr<ID3D12Resource> upVB, upIB;
+    auto makeUpload = [&](UINT64 bytes, const void* data, ComPtr<ID3D12Resource>& out)
+    {
+        auto bd = BufDesc(bytes);
+        ThrowIfFailed(m_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&out)), "Teapot Upload");
+        void* p; D3D12_RANGE rr{0,0};
+        out->Map(0, &rr, &p);
+        std::memcpy(p, data, (size_t)bytes);
+        out->Unmap(0, nullptr);
+    };
+    makeUpload(vbBytes, verts.data(), upVB);
+    makeUpload(ibBytes, idx.data(),   upIB);
+
+    ThrowIfFailed(m_cmdAlloc->Reset(), "Alloc Teapot Init");
+    ThrowIfFailed(m_cmdList->Reset(m_cmdAlloc.Get(), nullptr), "List Teapot Init");
+
+    m_cmdList->CopyBufferRegion(m_teapotVB.Get(), 0, upVB.Get(), 0, vbBytes);
+    m_cmdList->CopyBufferRegion(m_teapotIB.Get(), 0, upIB.Get(), 0, ibBytes);
+
+    D3D12_RESOURCE_BARRIER bars[2]{};
+    bars[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bars[0].Transition = { m_teapotVB.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER };
+    bars[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bars[1].Transition = { m_teapotIB.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDEX_BUFFER };
+    m_cmdList->ResourceBarrier(2, bars);
+
+    ThrowIfFailed(m_cmdList->Close(), "Close Teapot Init");
+    ID3D12CommandList* ls[] = { m_cmdList.Get() };
+    m_cmdQueue->ExecuteCommandLists(1, ls);
+    FlushCommandQueue();
+
+    m_teapotVBView.BufferLocation = m_teapotVB->GetGPUVirtualAddress();
+    m_teapotVBView.SizeInBytes    = (UINT)vbBytes;
+    m_teapotVBView.StrideInBytes  = sizeof(TeapotVertex);
+
+    m_teapotIBView.BufferLocation = m_teapotIB->GetGPUVirtualAddress();
+    m_teapotIBView.SizeInBytes    = (UINT)ibBytes;
+    m_teapotIBView.Format         = DXGI_FORMAT_R32_UINT;
 
     return true;
 }
@@ -1487,7 +1696,7 @@ bool RenderingSystem::BuildParticleRootSignatures()
     makeStructuredUAV(m_particlePool.Get(), nullptr, kMaxParticles, sizeof(GpuParticle), 0);
     makeStructuredUAV(m_particleDead.Get(), m_particleDeadCounter.Get(), kMaxParticles, sizeof(uint32_t), 3);
     makeStructuredUAV(m_particleDead.Get(), m_particleDeadCounter.Get(), kMaxParticles, sizeof(uint32_t), 4);
-    makeStructuredUAV(m_particleDrawArgs.Get(),     nullptr, 4, sizeof(uint32_t), 5);
+    makeStructuredUAV(m_particleDrawArgs.Get(),     nullptr, 5, sizeof(uint32_t), 5);
     makeStructuredUAV(m_particleDispatchArgs.Get(), nullptr, 4, sizeof(uint32_t), 6);
     makeStructuredSRV(m_particlePool.Get(), kMaxParticles, sizeof(GpuParticle), 9);
     // Слоты [1],[2],[7],[8] переписываются каждый кадр в ParticlesSimPass().
@@ -1529,7 +1738,11 @@ bool RenderingSystem::BuildParticleRootSignatures()
 
         D3D12_ROOT_SIGNATURE_DESC rsd{};
         rsd.NumParameters = 2; rsd.pParameters = params;
-        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        // ВАЖНО: раньше (billboard, без VB) флаг был не нужен — InputLayout был
+        // { nullptr, 0 }. Теперь PSO использует настоящий Input Assembler
+        // (VB/IB чайника), поэтому root signature ОБЯЗАНА явно это разрешать —
+        // без флага CreateGraphicsPipelineState падает с DXGI_ERROR_INVALID_CALL.
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ComPtr<ID3DBlob> ser, err;
         HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &ser, &err);
@@ -1547,11 +1760,14 @@ bool RenderingSystem::BuildParticleRootSignatures()
             IID_PPV_ARGS(&m_particleDispatchCmdSig)), "CmdSig Dispatch");
     }
     {
-        D3D12_INDIRECT_ARGUMENT_DESC arg{ D3D12_INDIRECT_ARGUMENT_TYPE_DRAW };
+        // DRAW_INDEXED — теперь рисуем настоящий индексированный меш чайника,
+        // instancing'ом (InstanceCount = число живых частиц, см. CSBuildIndirectArgs).
+        // D3D12_DRAW_INDEXED_ARGUMENTS = 5 × uint32 = 20 байт.
+        D3D12_INDIRECT_ARGUMENT_DESC arg{ D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED };
         D3D12_COMMAND_SIGNATURE_DESC csd{};
-        csd.ByteStride = 16; csd.NumArgumentDescs = 1; csd.pArgumentDescs = &arg;
+        csd.ByteStride = 20; csd.NumArgumentDescs = 1; csd.pArgumentDescs = &arg;
         ThrowIfFailed(m_device->CreateCommandSignature(&csd, nullptr,
-            IID_PPV_ARGS(&m_particleDrawCmdSig)), "CmdSig Draw");
+            IID_PPV_ARGS(&m_particleDrawCmdSig)), "CmdSig DrawIndexed");
     }
 
     return true;
@@ -1584,8 +1800,9 @@ bool RenderingSystem::BuildParticlePSOs()
     compile(L"ParticlesSim.hlsl", "CSBuildIndirectArgs", "cs_5_0", m_particleCSArgs);
 
     compile(L"ParticlesRender.hlsl", "VSMain_Particle", "vs_5_0", m_particleVS);
-    compile(L"ParticlesRender.hlsl", "GSMain_Particle", "gs_5_0", m_particleGS);
     compile(L"ParticlesRender.hlsl", "PSMain_Particle", "ps_5_0", m_particlePS);
+    // GS больше не компилируется — рисуем настоящий меш чайника, разворачивать
+    // из точки в квад больше не нужно.
 
     auto makeComputePSO = [&](ID3DBlob* cs, ComPtr<ID3D12PipelineState>& out, const char* tag)
     {
@@ -1598,7 +1815,7 @@ bool RenderingSystem::BuildParticlePSOs()
     makeComputePSO(m_particleCSEmit.Get(),   m_particleEmitPSO,   "Particle Emit PSO");
     makeComputePSO(m_particleCSArgs.Get(),   m_particleArgsPSO,   "Particle Args PSO");
 
-    // ── Render PSO: POINTLIST + GS, opaque (без blend, пишет depth) ────────
+    // ── Render PSO: TRIANGLELIST (реальный меш чайника), opaque (без blend, пишет depth) ────
     {
         D3D12_BLEND_DESC blend{};
         blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -1611,20 +1828,31 @@ bool RenderingSystem::BuildParticlePSOs()
 
         D3D12_RASTERIZER_DESC rast{};
         rast.FillMode        = D3D12_FILL_MODE_SOLID;
+        // CULL_NONE: процедурный меш чайника не гарантирует идеально
+        // консистентный winding order по всем частям (сфера/конус/тор
+        // генерируются разными функциями) — проще отключить backface
+        // culling, чем ловить "дыры" от неправильно повёрнутых треугольников.
+        // Можно включить D3D12_CULL_MODE_BACK после визуальной проверки.
         rast.CullMode        = D3D12_CULL_MODE_NONE;
         rast.DepthClipEnable = TRUE;
+
+        D3D12_INPUT_ELEMENT_DESC layout[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        };
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature    = m_particleRenderRootSig.Get();
         pd.VS                = { m_particleVS->GetBufferPointer(), m_particleVS->GetBufferSize() };
-        pd.GS                = { m_particleGS->GetBufferPointer(), m_particleGS->GetBufferSize() };
         pd.PS                = { m_particlePS->GetBufferPointer(), m_particlePS->GetBufferSize() };
         pd.BlendState        = blend;
         pd.RasterizerState   = rast;
         pd.DepthStencilState = ds;
         pd.SampleMask        = UINT_MAX;
-        pd.InputLayout       = { nullptr, 0 };
-        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        pd.InputLayout       = { layout, 2 };
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pd.NumRenderTargets  = 1;
         pd.RTVFormats[0]     = DXGI_FORMAT_R16G16B16A16_FLOAT; // HDR RT
         pd.DSVFormat         = DXGI_FORMAT_D24_UNORM_S8_UINT;
