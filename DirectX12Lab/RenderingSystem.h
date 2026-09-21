@@ -360,7 +360,7 @@ private:
     // Частицы — GPU-driven simulation (Homework #6)
     // ═══════════════════════════════════════════════════════════════════
     static constexpr uint32_t kMaxParticles      = 65536;
-    static constexpr uint32_t kParticlesPerFrame = 48; // темп эмиссии
+    static constexpr uint32_t kParticlesPerFrame = 4; // OBJ-меш через GS требует меньше экземпляров
 
     struct alignas(16) GpuParticle
     {
@@ -399,15 +399,16 @@ private:
         DirectX::XMFLOAT4   AmbientColor{ 0.15f, 0.15f, 0.18f, 1.f };
     };
 
-    // ── Меш "чайника" (вместо billboard-квада) — процедурная геометрия,
-    //    строится один раз в BuildTeapotMesh(), рисуется instancing'ом ──────
+    // Меш и текстура чайника загружаются из teapot.obj и textures/konvica.png.
     struct TeapotVertex
     {
         DirectX::XMFLOAT3 Pos;
         DirectX::XMFLOAT3 Normal;
+        DirectX::XMFLOAT2 TexCoord;
     };
     Microsoft::WRL::ComPtr<ID3D12Resource> m_teapotVB;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_teapotIB;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_teapotTexture;
     D3D12_VERTEX_BUFFER_VIEW m_teapotVBView{};
     D3D12_INDEX_BUFFER_VIEW  m_teapotIBView{};
     uint32_t m_teapotIndexCount = 0;
@@ -437,7 +438,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12CommandSignature> m_particleDispatchCmdSig;
 
     Microsoft::WRL::ComPtr<ID3DBlob> m_particleCSUpdate, m_particleCSEmit, m_particleCSArgs;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_particleVS, m_particlePS; // GS больше не нужен — рисуем реальный меш
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particleVS, m_particleGS, m_particlePS;
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_particleSimCB;
     uint8_t* m_mappedParticleSimCB = nullptr;

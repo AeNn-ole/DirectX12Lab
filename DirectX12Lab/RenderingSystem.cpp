@@ -115,7 +115,7 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     BuildWaterPSO();
     CreateShadowAreaTexture();
     BuildParticleBuffers();          // ← частицы (Homework #6)
-    BuildTeapotMesh();                // ← процедурный чайник вместо billboard-квада
+    BuildTeapotMesh();                // OBJ-модель для частиц
     BuildParticleRootSignatures();
     BuildParticlePSOs();
     InitLights();
@@ -1437,158 +1437,43 @@ bool RenderingSystem::BuildParticleBuffers()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Процедурная геометрия "чайника" — тело (приплюснутая сфера) + крышка
-// (сфера поменьше) + носик (конус) + ручка (дуга тора). Никаких внешних
-// .obj-файлов не требуется — вся геометрия считается математически один
-// раз при старте и заливается в статичный VB/IB (переиспользуется потом
-// instancing'ом — один и тот же меш рисуется N раз, N = число живых частиц).
+// Загружаем индексированный OBJ-меш один раз для всех живых частиц.
 // ─────────────────────────────────────────────────────────────────────────────
-namespace
-{
-    // Локальный тип с той же раскладкой, что и приватный RenderingSystem::TeapotVertex
-    // (POS+NORMAL по 12 байт) — свободные функции-генераторы геометрии не являются
-    // членами класса и не могут напрямую использовать его приватный вложенный тип,
-    // поэтому здесь используется layout-совместимый двойник, а в BuildTeapotMesh()
-    // (который УЖЕ является методом класса и имеет доступ к приватному типу)
-    // данные просто reinterpret_cast'ятся — раскладка байт идентична.
-    struct GenTeapotVertex
-    {
-        DirectX::XMFLOAT3 Pos;
-        DirectX::XMFLOAT3 Normal;
-    };
-
-    void AddSphere(std::vector<GenTeapotVertex>& verts, std::vector<uint32_t>& idx,
-                   DirectX::XMFLOAT3 center, float radius, float squashY, int stacks, int slices)
-    {
-        using namespace DirectX;
-        uint32_t base = (uint32_t)verts.size();
-        for (int i = 0; i <= stacks; ++i)
-        {
-            float v = (float)i / stacks;
-            float theta = v * XM_PI;
-            for (int j = 0; j <= slices; ++j)
-            {
-                float u = (float)j / slices;
-                float phi = u * XM_2PI;
-                float nx = sinf(theta) * cosf(phi);
-                float ny = cosf(theta);
-                float nz = sinf(theta) * sinf(phi);
-                GenTeapotVertex tv;
-                tv.Normal = { nx, ny, nz }; // нормаль недеформированной сферы — приближение, глазом незаметно
-                tv.Pos = { center.x + radius * nx, center.y + radius * squashY * ny, center.z + radius * nz };
-                verts.push_back(tv);
-            }
-        }
-        for (int i = 0; i < stacks; ++i)
-            for (int j = 0; j < slices; ++j)
-            {
-                uint32_t a = base + i * (slices + 1) + j;
-                uint32_t b = a + slices + 1;
-                idx.push_back(a); idx.push_back(b); idx.push_back(a + 1);
-                idx.push_back(a + 1); idx.push_back(b); idx.push_back(b + 1);
-            }
-    }
-
-    // Конус вдоль произвольной оси axisDir, без донышек (основание прячется
-    // внутри тела чайника — не видно, поэтому крышки не нужны)
-    void AddCone(std::vector<GenTeapotVertex>& verts, std::vector<uint32_t>& idx,
-                 DirectX::XMFLOAT3 baseCenter, DirectX::XMFLOAT3 axisDir, float length,
-                 float baseRadius, float tipRadius, int slices)
-    {
-        using namespace DirectX;
-        XMVECTOR axis = XMVector3Normalize(XMLoadFloat3(&axisDir));
-        XMVECTOR up = XMVectorSet(0, 1, 0, 0);
-        XMVECTOR right = XMVector3Normalize(XMVector3Cross(up, axis));
-        if (XMVectorGetX(XMVector3LengthSq(right)) < 1e-6f)
-            right = XMVector3Normalize(XMVector3Cross(XMVectorSet(1, 0, 0, 0), axis));
-        XMVECTOR fwd = XMVector3Cross(axis, right);
-
-        XMVECTOR baseC = XMLoadFloat3(&baseCenter);
-        XMVECTOR tipC  = XMVectorAdd(baseC, XMVectorScale(axis, length));
-
-        uint32_t base = (uint32_t)verts.size();
-        for (int j = 0; j <= slices; ++j)
-        {
-            float phi = (float)j / slices * XM_2PI;
-            XMVECTOR n = XMVectorAdd(XMVectorScale(right, cosf(phi)), XMVectorScale(fwd, sinf(phi)));
-            XMVECTOR pos = XMVectorAdd(baseC, XMVectorScale(n, baseRadius));
-            GenTeapotVertex tv; XMStoreFloat3(&tv.Pos, pos); XMStoreFloat3(&tv.Normal, n);
-            verts.push_back(tv);
-        }
-        for (int j = 0; j <= slices; ++j)
-        {
-            float phi = (float)j / slices * XM_2PI;
-            XMVECTOR n = XMVectorAdd(XMVectorScale(right, cosf(phi)), XMVectorScale(fwd, sinf(phi)));
-            XMVECTOR pos = XMVectorAdd(tipC, XMVectorScale(n, tipRadius));
-            GenTeapotVertex tv; XMStoreFloat3(&tv.Pos, pos); XMStoreFloat3(&tv.Normal, n);
-            verts.push_back(tv);
-        }
-        for (int j = 0; j < slices; ++j)
-        {
-            uint32_t a = base + j, b = base + j + 1;
-            uint32_t c = base + slices + 1 + j, d = c + 1;
-            idx.push_back(a); idx.push_back(c); idx.push_back(b);
-            idx.push_back(b); idx.push_back(c); idx.push_back(d);
-        }
-    }
-
-    // Дуга тора в плоскости XY (для вертикальной ручки сбоку чайника),
-    // ось "трубки" — вбок по Z.
-    void AddHandleArc(std::vector<GenTeapotVertex>& verts, std::vector<uint32_t>& idx,
-                       float xOffset, float yCenter, float armRadius, float tubeRadius,
-                       float startAngle, float endAngle, int segs, int slices)
-    {
-        using namespace DirectX;
-        uint32_t base = (uint32_t)verts.size();
-        for (int i = 0; i <= segs; ++i)
-        {
-            float t = startAngle + (endAngle - startAngle) * (float)i / segs;
-            XMFLOAT3 ringCenter = { xOffset + armRadius * cosf(t), yCenter + armRadius * sinf(t), 0.f };
-            XMVECTOR outward = XMVectorSet(cosf(t), sinf(t), 0, 0);
-            XMVECTOR side    = XMVectorSet(0, 0, 1, 0);
-            for (int j = 0; j <= slices; ++j)
-            {
-                float phi = (float)j / slices * XM_2PI;
-                XMVECTOR n = XMVectorAdd(XMVectorScale(outward, cosf(phi)), XMVectorScale(side, sinf(phi)));
-                XMVECTOR pos = XMVectorAdd(XMLoadFloat3(&ringCenter), XMVectorScale(n, tubeRadius));
-                GenTeapotVertex tv; XMStoreFloat3(&tv.Pos, pos); XMStoreFloat3(&tv.Normal, n);
-                verts.push_back(tv);
-            }
-        }
-        for (int i = 0; i < segs; ++i)
-            for (int j = 0; j < slices; ++j)
-            {
-                uint32_t a = base + i * (slices + 1) + j;
-                uint32_t b = a + slices + 1;
-                idx.push_back(a); idx.push_back(b); idx.push_back(a + 1);
-                idx.push_back(a + 1); idx.push_back(b); idx.push_back(b + 1);
-            }
-    }
-} // namespace
-
 bool RenderingSystem::BuildTeapotMesh()
 {
-    using namespace DirectX;
+    ObjModel model;
+    const wchar_t* meshPath = GetFileAttributesW(L"teapot.obj") != INVALID_FILE_ATTRIBUTES
+        ? L"teapot.obj" : L"textures/teapot.obj";
+    if (!LoadObj(meshPath, model) || model.vertices.empty() || model.indices.empty())
+        throw std::runtime_error("Cannot load teapot.obj (project root or textures)");
 
-    std::vector<GenTeapotVertex> verts;
-    std::vector<uint32_t>     idx;
-
-    // Тело — приплюснутая сфера (радиус 1, приплюснута по Y до 0.75)
-    AddSphere(verts, idx, { 0.f, 0.f, 0.f }, 1.0f, 0.75f, 14, 20);
-    // Крышка — сфера поменьше сверху
-    AddSphere(verts, idx, { 0.f, 0.82f, 0.f }, 0.32f, 0.55f, 8, 12);
-    // Носик — конус, торчащий вправо-вперёд-вверх
-    AddCone(verts, idx, { 0.85f, 0.05f, 0.f }, { 0.75f, 0.55f, 0.f }, 0.85f, 0.16f, 0.05f, 10);
-    // Ручка — дуга тора слева, вертикальная петля
-    AddHandleArc(verts, idx, -1.15f, 0.05f, 0.5f, 0.09f,
-                 XM_PIDIV2 * 0.55f, XM_PI - XM_PIDIV2 * 0.55f, 16, 8);
-
-    m_teapotIndexCount = (uint32_t)idx.size();
+    DirectX::XMFLOAT3 minPos = model.vertices.front().Pos;
+    DirectX::XMFLOAT3 maxPos = minPos;
+    for (const auto& v : model.vertices) {
+        minPos.x = (std::min)(minPos.x, v.Pos.x); maxPos.x = (std::max)(maxPos.x, v.Pos.x);
+        minPos.y = (std::min)(minPos.y, v.Pos.y); maxPos.y = (std::max)(maxPos.y, v.Pos.y);
+        minPos.z = (std::min)(minPos.z, v.Pos.z); maxPos.z = (std::max)(maxPos.z, v.Pos.z);
+    }
+    const DirectX::XMFLOAT3 center{
+        (minPos.x + maxPos.x) * 0.5f,
+        (minPos.y + maxPos.y) * 0.5f,
+        (minPos.z + maxPos.z) * 0.5f
+    };
+    std::vector<TeapotVertex> verts;
+    verts.reserve(model.vertices.size());
+    for (const auto& v : model.vertices) {
+        verts.push_back({
+            { v.Pos.x - center.x, v.Pos.y - center.y, v.Pos.z - center.z },
+            v.Normal, v.TexCoord
+        });
+    }
+    const auto& idx = model.indices;
+    m_teapotIndexCount = static_cast<uint32_t>(idx.size());
 
     auto defHeap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
     auto upHeap  = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
 
-    const UINT64 vbBytes = (UINT64)verts.size() * sizeof(GenTeapotVertex);
+    const UINT64 vbBytes = (UINT64)verts.size() * sizeof(TeapotVertex);
     const UINT64 ibBytes = (UINT64)idx.size()   * sizeof(uint32_t);
 
     auto vbDesc = BufDesc(vbBytes);
@@ -1640,13 +1525,18 @@ bool RenderingSystem::BuildTeapotMesh()
     m_teapotIBView.SizeInBytes    = (UINT)ibBytes;
     m_teapotIBView.Format         = DXGI_FORMAT_R32_UINT;
 
+    const wchar_t* texturePath = L"textures/konvica.png";
+    if (GetFileAttributesW(texturePath) == INVALID_FILE_ATTRIBUTES)
+        throw std::runtime_error("Cannot find textures/konvica.png");
+    LoadAndUploadTexture(texturePath, m_teapotTexture);
+
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BuildParticleRootSignatures
 //
-// Отдельная shader-visible куча m_particlesHeap (10 дескрипторов):
+// Отдельная shader-visible куча m_particlesHeap (11 дескрипторов):
 //   [0] UAV u0 Pool             — статично
 //   [1] UAV u1 AliveIn          — перезаписывается каждый кадр (ParticlesSimPass)
 //   [2] UAV u2 AliveOut         — перезаписывается каждый кадр
@@ -1657,11 +1547,12 @@ bool RenderingSystem::BuildTeapotMesh()
 //   [7] UAV u7 AliveOutCounter  — перезаписывается каждый кадр (plain-view счётчика)
 //   [8] SRV t0 AliveIndices     — перезаписывается каждый кадр (для рендера)
 //   [9] SRV t1 Pool             — статично (для рендера)
+//  [10] SRV t2 TeapotTexture    — статично (для рендера)
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildParticleRootSignatures()
 {
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.NumDescriptors = 10;
+    hd.NumDescriptors = 11;
     hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(m_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_particlesHeap)), "Particles Heap");
@@ -1699,6 +1590,12 @@ bool RenderingSystem::BuildParticleRootSignatures()
     makeStructuredUAV(m_particleDrawArgs.Get(),     nullptr, 5, sizeof(uint32_t), 5);
     makeStructuredUAV(m_particleDispatchArgs.Get(), nullptr, 4, sizeof(uint32_t), 6);
     makeStructuredSRV(m_particlePool.Get(), kMaxParticles, sizeof(GpuParticle), 9);
+    D3D12_SHADER_RESOURCE_VIEW_DESC texSrv{};
+    texSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    texSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    texSrv.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_teapotTexture.Get(), &texSrv, slot(10));
     // Слоты [1],[2],[7],[8] переписываются каждый кадр в ParticlesSimPass().
 
     // ── Compute root signature: b0 (CBV) + table u0..u7 ────────────────────
@@ -1724,9 +1621,9 @@ bool RenderingSystem::BuildParticleRootSignatures()
             ser->GetBufferSize(), IID_PPV_ARGS(&m_particleSimRootSig)), "CreateRS ParticleSim");
     }
 
-    // ── Render root signature: b0 (CBV) + table t0,t1 ───────────────────────
+    // ── Render root signature: b0 + table t0..t2 + sampler s0 ───────────────
     {
-        D3D12_DESCRIPTOR_RANGE range{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
+        D3D12_DESCRIPTOR_RANGE range{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND };
 
         D3D12_ROOT_PARAMETER params[2]{};
         params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -1738,6 +1635,16 @@ bool RenderingSystem::BuildParticleRootSignatures()
 
         D3D12_ROOT_SIGNATURE_DESC rsd{};
         rsd.NumParameters = 2; rsd.pParameters = params;
+        D3D12_STATIC_SAMPLER_DESC sampler{};
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        sampler.ShaderRegister = 0;
+        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        rsd.NumStaticSamplers = 1;
+        rsd.pStaticSamplers = &sampler;
         // ВАЖНО: раньше (billboard, без VB) флаг был не нужен — InputLayout был
         // { nullptr, 0 }. Теперь PSO использует настоящий Input Assembler
         // (VB/IB чайника), поэтому root signature ОБЯЗАНА явно это разрешать —
@@ -1774,8 +1681,7 @@ bool RenderingSystem::BuildParticleRootSignatures()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BuildParticlePSOs — компилирует шейдеры (ParticlesSim.hlsl/ParticlesRender.hlsl),
-// создаёт 3 compute PSO + 1 render PSO (POINTLIST+GS, opaque), плюс два CB.
+// BuildParticlePSOs — три compute PSO и PSO с VS+GS+PS для OBJ-частиц.
 // ─────────────────────────────────────────────────────────────────────────────
 bool RenderingSystem::BuildParticlePSOs()
 {
@@ -1800,9 +1706,8 @@ bool RenderingSystem::BuildParticlePSOs()
     compile(L"ParticlesSim.hlsl", "CSBuildIndirectArgs", "cs_5_0", m_particleCSArgs);
 
     compile(L"ParticlesRender.hlsl", "VSMain_Particle", "vs_5_0", m_particleVS);
+    compile(L"ParticlesRender.hlsl", "GSMain_Particle", "gs_5_0", m_particleGS);
     compile(L"ParticlesRender.hlsl", "PSMain_Particle", "ps_5_0", m_particlePS);
-    // GS больше не компилируется — рисуем настоящий меш чайника, разворачивать
-    // из точки в квад больше не нужно.
 
     auto makeComputePSO = [&](ID3DBlob* cs, ComPtr<ID3D12PipelineState>& out, const char* tag)
     {
@@ -1815,7 +1720,7 @@ bool RenderingSystem::BuildParticlePSOs()
     makeComputePSO(m_particleCSEmit.Get(),   m_particleEmitPSO,   "Particle Emit PSO");
     makeComputePSO(m_particleCSArgs.Get(),   m_particleArgsPSO,   "Particle Args PSO");
 
-    // ── Render PSO: TRIANGLELIST (реальный меш чайника), opaque (без blend, пишет depth) ────
+    // ── Render PSO: TRIANGLELIST, opaque (без blend, пишет depth) ─────────
     {
         D3D12_BLEND_DESC blend{};
         blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -1828,11 +1733,7 @@ bool RenderingSystem::BuildParticlePSOs()
 
         D3D12_RASTERIZER_DESC rast{};
         rast.FillMode        = D3D12_FILL_MODE_SOLID;
-        // CULL_NONE: процедурный меш чайника не гарантирует идеально
-        // консистентный winding order по всем частям (сфера/конус/тор
-        // генерируются разными функциями) — проще отключить backface
-        // culling, чем ловить "дыры" от неправильно повёрнутых треугольников.
-        // Можно включить D3D12_CULL_MODE_BACK после визуальной проверки.
+        // Некоторые грани OBJ имеют другой порядок вершин.
         rast.CullMode        = D3D12_CULL_MODE_NONE;
         rast.DepthClipEnable = TRUE;
 
@@ -1841,17 +1742,20 @@ bool RenderingSystem::BuildParticlePSOs()
               D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
             { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12,
               D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         };
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature    = m_particleRenderRootSig.Get();
         pd.VS                = { m_particleVS->GetBufferPointer(), m_particleVS->GetBufferSize() };
+        pd.GS                = { m_particleGS->GetBufferPointer(), m_particleGS->GetBufferSize() };
         pd.PS                = { m_particlePS->GetBufferPointer(), m_particlePS->GetBufferSize() };
         pd.BlendState        = blend;
         pd.RasterizerState   = rast;
         pd.DepthStencilState = ds;
         pd.SampleMask        = UINT_MAX;
-        pd.InputLayout       = { layout, 2 };
+        pd.InputLayout       = { layout, 3 };
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pd.NumRenderTargets  = 1;
         pd.RTVFormats[0]     = DXGI_FORMAT_R16G16B16A16_FLOAT; // HDR RT

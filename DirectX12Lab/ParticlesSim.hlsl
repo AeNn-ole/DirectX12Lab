@@ -30,7 +30,7 @@ ConsumeStructuredBuffer<uint>  gAliveIn          : register(u1);
 AppendStructuredBuffer<uint>   gAliveOut         : register(u2);
 AppendStructuredBuffer<uint>   gDeadAppend       : register(u3);
 ConsumeStructuredBuffer<uint>  gDeadConsume      : register(u4);
-RWStructuredBuffer<uint>       gDrawArgs         : register(u5); // [VtxCount, InstCount, StartVtx, StartInst]
+RWStructuredBuffer<uint>       gDrawArgs         : register(u5); // D3D12_DRAW_INDEXED_ARGUMENTS (5 uint)
 RWStructuredBuffer<uint>       gDispatchArgs     : register(u6); // [GroupsX, GroupsY, GroupsZ, AliveCount]
 RWStructuredBuffer<uint>       gAliveOutCounter  : register(u7); // сырое значение hidden-counter'а gAliveOut
 

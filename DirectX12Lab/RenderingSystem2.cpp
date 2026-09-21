@@ -774,11 +774,22 @@ void RenderingSystem::ParticlesSimPass()
     sd.Buffer.StructureByteStride = sizeof(uint32_t);
     m_device->CreateShaderResourceView(m_particleAlive[outIdx].Get(), &sd, slotCpu(8));
 
+    D3D12_RESOURCE_BARRIER toShader[2]{};
+    for (auto& barrier : toShader) {
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    }
+    toShader[0].Transition.pResource = m_particlePool.Get();
+    toShader[1].Transition.pResource = m_particleAlive[outIdx].Get();
+    m_cmdList->ResourceBarrier(2, toShader);
+
     m_particlePing = outIdx;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ParticlesRenderPass — DrawInstancedIndirect(POINTLIST) в HDR RT, опаково.
+// ParticlesRenderPass — индексированный OBJ-меш через GS в HDR RT.
 // ─────────────────────────────────────────────────────────────────────────────
 void RenderingSystem::ParticlesRenderPass()
 {
@@ -832,6 +843,17 @@ void RenderingSystem::ParticlesRenderPass()
 
     m_cmdList->ExecuteIndirect(m_particleDrawCmdSig.Get(), 1,
         m_particleDrawArgs.Get(), 0, nullptr, 0);
+
+    D3D12_RESOURCE_BARRIER toUav[2]{};
+    for (auto& barrier : toUav) {
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    toUav[0].Transition.pResource = m_particlePool.Get();
+    toUav[1].Transition.pResource = m_particleAlive[m_particlePing].Get();
+    m_cmdList->ResourceBarrier(2, toUav);
 
     D3D12_RESOURCE_BARRIER backToUav = toIndirect;
     backToUav.Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
@@ -906,7 +928,7 @@ void RenderingSystem::Draw()
     if (!m_wireframe) {
         LightingPass();
         ParticlesSimPass();      // ← частицы: COMPUTE update+emit+args
-        ParticlesRenderPass();   // ← частицы: GS billboard render (opaque)
+        ParticlesRenderPass();   // частицы: OBJ-меш через GS
         WaterPass();
         PostFxPass();
     } else {
